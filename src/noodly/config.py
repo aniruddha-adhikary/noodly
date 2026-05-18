@@ -30,6 +30,9 @@ class Settings(BaseSettings):
     # Graph
     group_id: str = "default"
 
+    # Storage backend — set to true to store claims as Graphiti edges
+    use_graphiti_backend: bool = False
+
 
 def get_settings() -> Settings:
     """Return cached settings instance."""

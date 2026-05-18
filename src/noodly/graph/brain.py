@@ -7,6 +7,7 @@ import logging
 
 from graphiti_core import Graphiti
 from graphiti_core.driver.falkordb_driver import FalkorDriver
+from graphiti_core.embedder_client import EmbedderClient
 from graphiti_core.nodes import EpisodeType
 from graphiti_core.search.search_config_recipes import (
     EDGE_HYBRID_SEARCH_RRF,
@@ -41,6 +42,19 @@ class Brain:
             database=settings.falkordb_database,
         )
         self._graphiti = Graphiti(graph_driver=driver)
+
+    @property
+    def group_id(self) -> str:
+        """The configured graph partition identifier."""
+        return self._settings.group_id
+
+    def get_graphiti(self) -> Graphiti:
+        """Return the underlying Graphiti instance for direct operations."""
+        return self._graphiti
+
+    def get_embedder(self) -> EmbedderClient:
+        """Return the Graphiti embedder for reuse elsewhere."""
+        return self._graphiti.embedder
 
     async def initialize(self) -> None:
         """Set up graph indices. Call once on first run."""
