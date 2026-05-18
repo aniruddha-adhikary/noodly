@@ -7,7 +7,7 @@ import logging
 
 from graphiti_core import Graphiti
 from graphiti_core.driver.falkordb_driver import FalkorDriver
-from graphiti_core.embedder_client import EmbedderClient
+from graphiti_core.embedder import EmbedderClient
 from graphiti_core.nodes import EpisodeType
 from graphiti_core.search.search_config_recipes import (
     EDGE_HYBRID_SEARCH_RRF,
