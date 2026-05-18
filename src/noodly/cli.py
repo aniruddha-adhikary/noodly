@@ -52,7 +52,9 @@ def init() -> None:
 
 @cli.command()
 @click.option(
-    "--watch-dir", type=click.Path(exists=True), default=None,
+    "--watch-dir",
+    type=click.Path(exists=True),
+    default=None,
     help="Override watch directory",
 )
 def ingest(watch_dir: str | None) -> None:
@@ -429,11 +431,16 @@ def conflicts_detect() -> None:
 
 
 @conflicts.command(name="resolve")
-@click.option("--auto-threshold", "-t", type=float, default=None,
-              help="Override auto-resolve threshold")
-@click.option("--strategy", "-s", type=click.Choice(
-    ["authority_wins", "recency_wins", "majority_wins", "higher_score"]),
-    default=None, help="Override resolution strategy")
+@click.option(
+    "--auto-threshold", "-t", type=float, default=None, help="Override auto-resolve threshold"
+)
+@click.option(
+    "--strategy",
+    "-s",
+    type=click.Choice(["authority_wins", "recency_wins", "majority_wins", "higher_score"]),
+    default=None,
+    help="Override resolution strategy",
+)
 def conflicts_resolve(auto_threshold: float | None, strategy: str | None) -> None:
     """Detect and resolve conflicts among existing claims."""
     from noodly.resolution.audit import ResolutionAudit
@@ -484,9 +491,7 @@ def conflicts_resolve(auto_threshold: float | None, strategy: str | None) -> Non
 
     auto = sum(1 for r in resolutions if r.winner_id is not None)
     manual = sum(1 for r in resolutions if r.winner_id is None)
-    console.print(
-        f"[green]Resolved:[/green] {auto} auto-resolved, {manual} pending manual review"
-    )
+    console.print(f"[green]Resolved:[/green] {auto} auto-resolved, {manual} pending manual review")
 
 
 @cli.group()
@@ -523,6 +528,136 @@ def dispatch_stats() -> None:
             console.print("  Resolutions file: corrupt")
     else:
         console.print("  Resolutions: none")
+
+
+@cli.group()
+def gitlab() -> None:
+    """GitLab knowledge projection commands."""
+
+
+@gitlab.command(name="sync")
+@click.option("--message", "-m", default="", help="Custom commit message")
+def gitlab_sync(message: str) -> None:
+    """Full sync: render all claims and push to GitLab."""
+    from noodly.dispatch.gitlab_handler import GitLabConfig
+    from noodly.projection.gitlab import GitLabProjector
+    from noodly.scoring.ledger import FactLedger
+
+    settings = get_settings()
+    if not settings.gitlab_token:
+        console.print("[red]NOODLY_GITLAB_TOKEN not configured.[/red]")
+        return
+
+    ledger = FactLedger(settings.brain_dir / "ledger.json")
+    claims_list = ledger.list_claims(limit=10000)
+    if not claims_list:
+        console.print("[yellow]No claims in ledger.[/yellow]")
+        return
+
+    config = GitLabConfig(
+        url=settings.gitlab_url,
+        token=settings.gitlab_token,
+        project_id=settings.gitlab_project_id,
+        target_branch=settings.gitlab_target_branch,
+        knowledge_path=settings.gitlab_knowledge_path,
+    )
+    projector = GitLabProjector(config)
+
+    async def _sync():
+        result = await projector.sync_full(claims_list, commit_message=message)
+        await projector.close()
+        return result
+
+    result = _run(_sync())
+    console.print(f"[green]GitLab sync:[/green] {result.summary}")
+    if result.commit_sha:
+        console.print(f"  Commit: {result.commit_sha[:12]}")
+
+
+@gitlab.command(name="push")
+@click.option("--subjects", "-s", multiple=True, help="Only push specific entities")
+@click.option("--message", "-m", default="", help="Custom commit message")
+def gitlab_push(subjects: tuple[str, ...], message: str) -> None:
+    """Incremental push: update only changed entities in GitLab."""
+    from noodly.dispatch.gitlab_handler import GitLabConfig
+    from noodly.projection.gitlab import GitLabProjector
+    from noodly.scoring.ledger import FactLedger
+
+    settings = get_settings()
+    if not settings.gitlab_token:
+        console.print("[red]NOODLY_GITLAB_TOKEN not configured.[/red]")
+        return
+
+    ledger = FactLedger(settings.brain_dir / "ledger.json")
+    claims_list = ledger.list_claims(limit=10000)
+    if not claims_list:
+        console.print("[yellow]No claims in ledger.[/yellow]")
+        return
+
+    changed = set(subjects) if subjects else {c.subject for c in claims_list}
+
+    config = GitLabConfig(
+        url=settings.gitlab_url,
+        token=settings.gitlab_token,
+        project_id=settings.gitlab_project_id,
+        target_branch=settings.gitlab_target_branch,
+        knowledge_path=settings.gitlab_knowledge_path,
+    )
+    projector = GitLabProjector(config)
+
+    async def _push():
+        result = await projector.sync_incremental(claims_list, changed, commit_message=message)
+        await projector.close()
+        return result
+
+    result = _run(_push())
+    console.print(f"[green]GitLab push:[/green] {result.summary}")
+    if result.commit_sha:
+        console.print(f"  Commit: {result.commit_sha[:12]}")
+
+
+@gitlab.command(name="diff")
+def gitlab_diff() -> None:
+    """Preview what would change on next sync (dry run)."""
+    from noodly.dispatch.gitlab_handler import GitLabConfig
+    from noodly.projection.gitlab import GitLabProjector
+    from noodly.scoring.ledger import FactLedger
+
+    settings = get_settings()
+    if not settings.gitlab_token:
+        console.print("[red]NOODLY_GITLAB_TOKEN not configured.[/red]")
+        return
+
+    ledger = FactLedger(settings.brain_dir / "ledger.json")
+    claims_list = ledger.list_claims(limit=10000)
+    if not claims_list:
+        console.print("[yellow]No claims in ledger.[/yellow]")
+        return
+
+    config = GitLabConfig(
+        url=settings.gitlab_url,
+        token=settings.gitlab_token,
+        project_id=settings.gitlab_project_id,
+        target_branch=settings.gitlab_target_branch,
+        knowledge_path=settings.gitlab_knowledge_path,
+    )
+    projector = GitLabProjector(config)
+
+    # Render locally to show what files would be generated
+    local_files = projector._render_all(claims_list)
+
+    console.print("\n[bold]GitLab Projection Preview[/bold]")
+    console.print(f"  Target: {settings.gitlab_url} (project {settings.gitlab_project_id})")
+    console.print(f"  Branch: {settings.gitlab_target_branch}")
+    console.print(f"  Path: {settings.gitlab_knowledge_path}/")
+    console.print(f"  Files to render: {len(local_files)}")
+
+    table = Table(title="Files")
+    table.add_column("Path", style="cyan")
+    table.add_column("Size", justify="right")
+    for path in sorted(local_files):
+        table.add_row(path, f"{len(local_files[path])} chars")
+    console.print(table)
 
 
 @cli.group()

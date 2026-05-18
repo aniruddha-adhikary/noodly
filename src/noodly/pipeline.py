@@ -75,9 +75,7 @@ class Pipeline:
             self._dispatcher.register(AuditLogHandler(audit_path=audit_path))
 
         # Phase 4: conflict resolution
-        self._resolution_audit = ResolutionAudit(
-            settings.brain_dir / "resolutions.json"
-        )
+        self._resolution_audit = ResolutionAudit(settings.brain_dir / "resolutions.json")
         self._conflict_resolver: ConflictResolver | None = None
         self._conflict_detector: ConflictDetector | None = None
         if settings.enable_conflict_resolution:
@@ -120,6 +118,21 @@ class Pipeline:
                 event_types=[ChangeType.conflict_detected],
             )
 
+        # Phase 6: GitLab knowledge projection
+        self._gitlab_projector = None
+        if settings.enable_gitlab_projection and settings.gitlab_token:
+            from noodly.dispatch.gitlab_handler import GitLabConfig
+            from noodly.projection.gitlab import GitLabProjector
+
+            gl_config = GitLabConfig(
+                url=settings.gitlab_url,
+                token=settings.gitlab_token,
+                project_id=settings.gitlab_project_id,
+                target_branch=settings.gitlab_target_branch,
+                knowledge_path=settings.gitlab_knowledge_path,
+            )
+            self._gitlab_projector = GitLabProjector(gl_config)
+
         # Phase 4: semantic dedup
         self._semantic_dedup = None
         if settings.enable_semantic_dedup and settings.openai_api_key:
@@ -155,9 +168,7 @@ class Pipeline:
         # Phase 4/5: semantic dedup before storing — actually merge evidence
         if self._semantic_dedup is not None and all_claims:
             existing = self._ledger.list_claims(limit=10000)
-            dedup_result = await self._semantic_dedup.deduplicate_and_merge(
-                all_claims, existing
-            )
+            dedup_result = await self._semantic_dedup.deduplicate_and_merge(all_claims, existing)
             if dedup_result.merged_count > 0:
                 logger.info(
                     "Semantic dedup: merged %d claims, %d unique",
@@ -196,6 +207,19 @@ class Pipeline:
 
         all_ledger_claims = self._ledger.list_claims(limit=10000)
         stats["projected"] = self._projector.project(all_ledger_claims)
+
+        # Phase 6: sync to GitLab (incremental — only changed subjects)
+        if self._gitlab_projector is not None:
+            changed_subjects = {c.subject for c in all_claims}
+            try:
+                gl_result = await self._gitlab_projector.sync_incremental(
+                    all_ledger_claims, changed_subjects
+                )
+                stats["gitlab_synced"] = gl_result.total_changes
+                if gl_result.total_changes > 0:
+                    logger.info("GitLab sync: %s", gl_result.summary)
+            except Exception:
+                logger.exception("GitLab projection sync failed")
 
         logger.info(
             "Pipeline complete: %d artifacts, %d claims (%d cached), %d projected",
@@ -293,13 +317,9 @@ class Pipeline:
                 )
                 # Pass source filename for provenance tracking
                 source_file = (
-                    Path(artifact.source_uri).name
-                    if artifact.source_uri
-                    else artifact.title
+                    Path(artifact.source_uri).name if artifact.source_uri else artifact.title
                 )
-                claims = await self._extractor.extract(
-                    chunk_artifact, source_filename=source_file
-                )
+                claims = await self._extractor.extract(chunk_artifact, source_filename=source_file)
                 all_claims.extend(claims)
 
                 self._cache.extraction.put(
@@ -445,3 +465,5 @@ class Pipeline:
     async def close(self) -> None:
         """Shut down connections."""
         await self._brain.close()
+        if self._gitlab_projector is not None:
+            await self._gitlab_projector.close()
