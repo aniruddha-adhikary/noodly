@@ -16,6 +16,21 @@ from noodly.config import get_settings
 console = Console()
 
 
+def _build_ledger(settings=None):
+    """Build a FactLedger using the configured backend."""
+    from noodly.scoring.ledger import FactLedger
+
+    if settings is None:
+        settings = get_settings()
+    if settings.use_graphiti_backend:
+        from noodly.graph.brain import Brain
+        from noodly.storage.graphiti_backend import GraphitiBackend
+
+        brain = Brain(settings)
+        return FactLedger(backend=GraphitiBackend(brain)), brain
+    return FactLedger(backend=settings.brain_dir / "ledger.json"), None
+
+
 def _run(coro):
     """Run an async coroutine from sync Click commands."""
     return asyncio.run(coro)
@@ -149,10 +164,12 @@ def search(query: str, limit: int) -> None:
 def claims(status: str, limit: int) -> None:
     """List claims from the fact ledger."""
     from noodly.models.claims import ClaimStatus
-    from noodly.scoring.ledger import FactLedger
 
     settings = get_settings()
-    ledger = FactLedger(settings.brain_dir / "ledger.json")
+    ledger, brain = _build_ledger(settings)
+
+    if ledger.is_async_backend:
+        _run(ledger.load_async())
 
     claim_status = None
     if status:
@@ -160,6 +177,8 @@ def claims(status: str, limit: int) -> None:
             claim_status = ClaimStatus(status)
         except ValueError:
             console.print(f"[red]Unknown status: {status}[/red]")
+            if brain:
+                _run(brain.close())
             return
 
     results = ledger.list_claims(status=claim_status, limit=limit)
@@ -186,14 +205,18 @@ def claims(status: str, limit: int) -> None:
 
     console.print(table)
 
+    if brain:
+        _run(brain.close())
+
 
 @cli.command()
 def stats() -> None:
     """Show brain statistics."""
-    from noodly.scoring.ledger import FactLedger
-
     settings = get_settings()
-    ledger = FactLedger(settings.brain_dir / "ledger.json")
+    ledger, brain = _build_ledger(settings)
+
+    if ledger.is_async_backend:
+        _run(ledger.load_async())
 
     all_claims = ledger.list_claims(limit=10000)
 
@@ -220,20 +243,70 @@ def stats() -> None:
         for k, count in sorted(class_counts.items()):
             console.print(f"  {k}: {count}")
 
+    if brain:
+        _run(brain.close())
+
 
 @cli.command()
 def project() -> None:
     """Project the current brain state to Markdown files."""
     from noodly.projection.markdown import MarkdownProjector
-    from noodly.scoring.ledger import FactLedger
 
     settings = get_settings()
-    ledger = FactLedger(settings.brain_dir / "ledger.json")
+    ledger, brain = _build_ledger(settings)
+
+    if ledger.is_async_backend:
+        _run(ledger.load_async())
+
     projector = MarkdownProjector(settings.brain_dir)
 
     all_claims = ledger.list_claims(limit=10000)
     written = projector.project(all_claims)
     console.print(f"[green]Projected {written} Markdown files to {settings.brain_dir}[/green]")
+
+    if brain:
+        _run(brain.close())
+
+
+@cli.command()
+def migrate() -> None:
+    """Migrate claims from JSON ledger to Graphiti backend."""
+    from noodly.graph.brain import Brain
+    from noodly.scoring.ledger import FactLedger
+    from noodly.storage.graphiti_backend import GraphitiBackend
+
+    settings = get_settings()
+    json_path = settings.brain_dir / "ledger.json"
+
+    if not json_path.exists():
+        console.print(f"[red]No JSON ledger found at {json_path}[/red]")
+        return
+
+    json_ledger = FactLedger(backend=json_path)
+    all_claims = json_ledger.list_claims(limit=100000)
+
+    if not all_claims:
+        console.print("[yellow]No claims to migrate.[/yellow]")
+        return
+
+    console.print(f"Found {len(all_claims)} claims to migrate.")
+
+    brain = Brain(settings)
+    graphiti_backend = GraphitiBackend(brain)
+
+    async def _migrate():
+        await brain.initialize()
+        for i, claim in enumerate(all_claims, 1):
+            await graphiti_backend.save_claim_async(claim)
+            if i % 10 == 0:
+                console.print(f"  Migrated {i}/{len(all_claims)}...")
+        await brain.close()
+
+    _run(_migrate())
+    console.print(
+        f"[green]Migrated {len(all_claims)} claims to Graphiti backend.[/green]\n"
+        "Set NOODLY_USE_GRAPHITI_BACKEND=true to use the new backend."
+    )
 
 
 @cli.command()

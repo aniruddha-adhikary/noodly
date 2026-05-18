@@ -34,12 +34,22 @@ class Pipeline:
             api_key=settings.openai_api_key,
             model=settings.openai_model,
         )
-        self._ledger = FactLedger(settings.brain_dir / "ledger.json")
+        self._ledger = self._build_ledger(settings)
         self._projector = MarkdownProjector(settings.brain_dir)
 
+    def _build_ledger(self, settings: Settings) -> FactLedger:
+        if settings.use_graphiti_backend:
+            from noodly.storage.graphiti_backend import GraphitiBackend
+
+            backend = GraphitiBackend(self._brain)
+            return FactLedger(backend=backend)
+        return FactLedger(backend=settings.brain_dir / "ledger.json")
+
     async def initialize(self) -> None:
-        """Set up graph indices."""
+        """Set up graph indices and load async backends."""
         await self._brain.initialize()
+        if self._ledger.is_async_backend:
+            await self._ledger.load_async()
         logger.info("Pipeline initialized")
 
     async def run(self) -> dict[str, int]:
@@ -69,7 +79,10 @@ class Pipeline:
                 logger.exception("Failed to extract claims from %s", artifact.id)
 
         # 4. Store claims in ledger
-        stored = self._ledger.add_claims(all_claims)
+        if self._ledger.is_async_backend:
+            stored = await self._ledger.add_claims_async(all_claims)
+        else:
+            stored = self._ledger.add_claims(all_claims)
         stats["claims"] = len(stored)
 
         # 5. Apply decay
@@ -100,7 +113,10 @@ class Pipeline:
 
         await self._brain.ingest_artifact(artifact)
         claims = await self._extractor.extract(artifact)
-        stored = self._ledger.add_claims(claims)
+        if self._ledger.is_async_backend:
+            stored = await self._ledger.add_claims_async(claims)
+        else:
+            stored = self._ledger.add_claims(claims)
 
         all_claims = self._ledger.list_claims(limit=10000)
         projected = self._projector.project(all_claims)
