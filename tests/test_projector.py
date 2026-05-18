@@ -70,7 +70,7 @@ def test_project_skips_superseded(tmp_brain):
     assert "old" not in entity_page
 
 
-def test_project_claim_files_by_class(tmp_brain):
+def test_project_entity_pages_by_subject(tmp_brain):
     projector = MarkdownProjector(tmp_brain)
     claims = [
         _make_claim("A", "is", "stable", knowledge_class=KnowledgeClass.stable),
@@ -78,8 +78,9 @@ def test_project_claim_files_by_class(tmp_brain):
     ]
     projector.project(claims)
 
-    assert (tmp_brain / "claims" / "stable").is_dir()
-    assert (tmp_brain / "claims" / "process").is_dir()
+    # Phase 7: consolidated structure uses entities/ directory
+    assert (tmp_brain / "entities" / "a.md").exists()
+    assert (tmp_brain / "entities" / "b.md").exists()
 
 
 def test_project_empty_claims(tmp_brain):

@@ -238,17 +238,37 @@ def stats() -> None:
 
 
 @cli.command()
-def project() -> None:
+@click.option("--full", is_flag=True, help="Force full re-render (ignore manifest)")
+def project(full: bool) -> None:
     """Project the current brain state to Markdown files."""
     from noodly.projection.markdown import MarkdownProjector
     from noodly.scoring.ledger import FactLedger
+    from noodly.scoring.topic_classifier import TopicClassifier
 
     settings = get_settings()
     ledger = FactLedger(settings.brain_dir / "ledger.json")
     projector = MarkdownProjector(settings.brain_dir)
 
     all_claims = ledger.list_claims(limit=10000)
-    written = projector.project(all_claims)
+
+    # Classify topics if enabled
+    topic_map: dict[str, list[str]] | None = None
+    if settings.enable_topic_clustering and settings.openai_api_key:
+        classifier = TopicClassifier(
+            api_key=settings.openai_api_key,
+            model=settings.topic_model,
+            mode=settings.authority_topic_inference,
+            cache_path=settings.brain_dir / "topic_cache.json",
+        )
+
+        async def _classify():
+            return await classifier.classify(all_claims)
+
+        topic_map = _run(_classify())
+        topic_count = len(classifier.get_all_topics())
+        console.print(f"[dim]Classified {len(all_claims)} claims into {topic_count} topics[/dim]")
+
+    written = projector.project(all_claims, topic_map=topic_map, force_full=full)
     console.print(f"[green]Projected {written} Markdown files to {settings.brain_dir}[/green]")
 
 
@@ -281,10 +301,16 @@ def authority_list() -> None:
 
     table = Table(title="Source Authority Weights")
     table.add_column("Source", style="cyan")
+    table.add_column("Topic", style="dim")
     table.add_column("Weight", justify="right")
 
     for source, weight in sources.items():
-        table.add_row(source, f"{weight:.2f}")
+        if isinstance(weight, dict):
+            for topic, tw in sorted(weight.items()):
+                label = "(default)" if topic == "_default" else topic
+                table.add_row(source, label, f"{tw:.2f}")
+        else:
+            table.add_row(source, "(all)", f"{weight:.2f}")
 
     console.print(table)
 
@@ -292,26 +318,35 @@ def authority_list() -> None:
 @authority.command(name="set")
 @click.argument("source")
 @click.argument("weight", type=float)
-def authority_set(source: str, weight: float) -> None:
-    """Set authority weight for a source (0.0-1.0)."""
+@click.option("--topic", "-t", default=None, help="Set weight for a specific topic")
+def authority_set(source: str, weight: float, topic: str | None) -> None:
+    """Set authority weight for a source (0.0-1.0), optionally per-topic."""
     from noodly.scoring.authority import AuthorityRegistry
 
     settings = get_settings()
     registry = AuthorityRegistry(settings.brain_dir / "authority.json")
-    registry.set(source, weight)
-    console.print(f"[green]Set {source} = {registry.get(source):.2f}[/green]")
+    registry.set(source, weight, topic=topic)
+    if topic:
+        weight_val = registry.get(source, topic=topic)
+        console.print(f"[green]Set {source}[{topic}] = {weight_val:.2f}[/green]")
+    else:
+        console.print(f"[green]Set {source} = {registry.get(source):.2f}[/green]")
 
 
 @authority.command(name="remove")
 @click.argument("source")
-def authority_remove(source: str) -> None:
-    """Remove a source from the authority registry."""
+@click.option("--topic", "-t", default=None, help="Remove only a specific topic weight")
+def authority_remove(source: str, topic: str | None) -> None:
+    """Remove a source (or topic weight) from the authority registry."""
     from noodly.scoring.authority import AuthorityRegistry
 
     settings = get_settings()
     registry = AuthorityRegistry(settings.brain_dir / "authority.json")
-    if registry.remove(source):
-        console.print(f"[green]Removed {source}[/green]")
+    if registry.remove(source, topic=topic):
+        if topic:
+            console.print(f"[green]Removed {source}[{topic}][/green]")
+        else:
+            console.print(f"[green]Removed {source}[/green]")
     else:
         console.print(f"[yellow]{source} not found in registry[/yellow]")
 

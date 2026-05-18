@@ -10,6 +10,7 @@ from noodly.config import Settings
 from noodly.connectors.local_fs import LocalFSConnector
 from noodly.dispatch.dispatcher import EventDispatcher
 from noodly.dispatch.handlers import AuditLogHandler, ConflictEscalationHandler
+from noodly.extraction.dispatcher import LLMJob, LLMJobDispatcher
 from noodly.extraction.extractor import ClaimExtractor
 from noodly.graph.brain import Brain
 from noodly.models.artifacts import SourceArtifact
@@ -47,6 +48,13 @@ class Pipeline:
             api_key=settings.openai_api_key,
             model=settings.openai_model,
         )
+        self._llm_dispatcher = LLMJobDispatcher(
+            extractor=self._extractor,
+            max_concurrent=settings.llm_max_concurrent,
+            rate_limit_rpm=settings.llm_rate_limit_rpm,
+            retry_max=settings.llm_retry_max,
+            request_timeout=settings.llm_request_timeout,
+        )
         self._authority = AuthorityRegistry(settings.brain_dir / "authority.json")
         self._ledger = FactLedger(
             settings.brain_dir / "ledger.json",
@@ -65,14 +73,14 @@ class Pipeline:
         self._chunk_size = settings.chunk_size
 
         # Phase 4: event dispatch
-        self._dispatcher = EventDispatcher()
+        self._event_dispatcher = EventDispatcher()
         if settings.enable_event_dispatch:
             audit_path = (
                 Path(settings.audit_log_path)
                 if settings.audit_log_path
                 else settings.brain_dir / "audit.jsonl"
             )
-            self._dispatcher.register(AuditLogHandler(audit_path=audit_path))
+            self._event_dispatcher.register(AuditLogHandler(audit_path=audit_path))
 
         # Phase 4: conflict resolution
         self._resolution_audit = ResolutionAudit(settings.brain_dir / "resolutions.json")
@@ -96,7 +104,7 @@ class Pipeline:
                     knowledge_path=settings.gitlab_knowledge_path,
                 )
                 gitlab_handler = GitLabMRHandler(gitlab_config)
-                self._dispatcher.register(
+                self._event_dispatcher.register(
                     gitlab_handler,
                     event_types=[ChangeType.conflict_detected],
                 )
@@ -113,7 +121,7 @@ class Pipeline:
             self._conflict_detector = ConflictDetector(
                 similarity_threshold=settings.conflict_similarity_threshold,
             )
-            self._dispatcher.register(
+            self._event_dispatcher.register(
                 ConflictEscalationHandler(resolver=self._conflict_resolver),
                 event_types=[ChangeType.conflict_detected],
             )
@@ -142,6 +150,18 @@ class Pipeline:
                 api_key=settings.openai_api_key,
                 model=settings.embedding_model,
                 threshold=settings.semantic_dedup_threshold,
+            )
+
+        # Phase 7: topic classifier
+        self._topic_classifier = None
+        if settings.enable_topic_clustering and settings.openai_api_key:
+            from noodly.scoring.topic_classifier import TopicClassifier
+
+            self._topic_classifier = TopicClassifier(
+                api_key=settings.openai_api_key,
+                model=settings.topic_model,
+                mode=settings.authority_topic_inference,
+                cache_path=settings.brain_dir / "topic_cache.json",
             )
 
     async def initialize(self) -> None:
@@ -205,8 +225,26 @@ class Pipeline:
         if self._settings.enable_graph_agent and all_claims:
             await self._run_graph_agent(all_claims)
 
+        # Phase 7: classify topics for projection and authority
         all_ledger_claims = self._ledger.list_claims(limit=10000)
-        stats["projected"] = self._projector.project(all_ledger_claims)
+        changed_claim_ids = {str(c.id) for c in all_claims}
+        topic_map: dict[str, list[str]] | None = None
+        if self._topic_classifier is not None:
+            topic_map = await self._topic_classifier.classify(
+                all_ledger_claims,
+                existing_topics=self._topic_classifier.get_all_topics(),
+            )
+            stats["topics_classified"] = len(
+                {t for ts in topic_map.values() for t in ts}
+            )
+
+        force_full = self._settings.emission_mode == "full"
+        stats["projected"] = self._projector.project(
+            all_ledger_claims,
+            topic_map=topic_map,
+            changed_claim_ids=changed_claim_ids,
+            force_full=force_full,
+        )
 
         # Phase 6: sync to GitLab (incremental — only changed subjects)
         if self._gitlab_projector is not None:
@@ -289,10 +327,16 @@ class Pipeline:
         except Exception:
             logger.exception("Failed to ingest artifact %s", artifact.id)
 
-        # 6. Chunk and extract (with caching)
+        # 6. Chunk and extract (with caching + parallel dispatch)
         chunks = chunk_markdown(markdown, max_chars=self._chunk_size)
         all_claims: list[Claim] = []
         cached_count = 0
+
+        source_file = Path(artifact.source_uri).name if artifact.source_uri else artifact.title
+
+        # Separate cached vs uncached chunks
+        pending_jobs: list[LLMJob] = []
+        pending_hashes: list[str] = []
 
         for chunk in chunks:
             chunk_hash = content_hash(chunk.content)
@@ -304,24 +348,37 @@ class Pipeline:
                 cached_count += 1
                 continue
 
-            try:
-                chunk_artifact = SourceArtifact(
-                    source_type=artifact.source_type,
-                    source_uri=artifact.source_uri,
-                    title=f"{artifact.title} [{chunk.heading or f'chunk-{chunk.index}'}]",
-                    body=chunk.content,
-                    author=artifact.author,
-                    content_created_at=artifact.content_created_at,
-                    metadata=artifact.metadata,
-                    id=artifact.id,
+            chunk_artifact = SourceArtifact(
+                source_type=artifact.source_type,
+                source_uri=artifact.source_uri,
+                title=f"{artifact.title} [{chunk.heading or f'chunk-{chunk.index}'}]",
+                body=chunk.content,
+                author=artifact.author,
+                content_created_at=artifact.content_created_at,
+                metadata=artifact.metadata,
+                id=artifact.id,
+            )
+            pending_jobs.append(
+                LLMJob(
+                    artifact=chunk_artifact,
+                    source_filename=source_file,
+                    chunk_index=chunk.index,
                 )
-                # Pass source filename for provenance tracking
-                source_file = (
-                    Path(artifact.source_uri).name if artifact.source_uri else artifact.title
-                )
-                claims = await self._extractor.extract(chunk_artifact, source_filename=source_file)
-                all_claims.extend(claims)
+            )
+            pending_hashes.append(chunk_hash)
 
+        # Dispatch uncached chunks in parallel
+        if pending_jobs:
+            results = await self._llm_dispatcher.submit_batch(pending_jobs)
+            for result, chunk_hash in zip(results, pending_hashes):
+                if result.error is not None:
+                    logger.error(
+                        "Chunk extraction failed for %s: %s",
+                        result.job_id,
+                        result.error,
+                    )
+                    continue
+                all_claims.extend(result.claims)
                 self._cache.extraction.put(
                     chunk_hash,
                     [
@@ -337,11 +394,9 @@ class Pipeline:
                                 c.evidence[0].source_artifact if c.evidence else ""
                             ),
                         }
-                        for c in claims
+                        for c in result.claims
                     ],
                 )
-            except Exception:
-                logger.exception("Failed to extract claims from chunk %d", chunk.index)
 
         for claim in all_claims:
             self._changelog.emit(

@@ -72,13 +72,16 @@ class FactLedger:
         data = [claim.model_dump(mode="json") for claim in self._claims.values()]
         self._path.write_text(json.dumps(data, indent=2, default=str))
 
-    def _apply_authority(self, claim: Claim) -> None:
-        """Stamp evidence with authority weights from the registry."""
+    def _apply_authority(self, claim: Claim, topic: str | None = None) -> None:
+        """Stamp evidence with authority weights from the registry.
+
+        If ``topic`` is provided, uses topic-aware authority lookup.
+        """
         if self._authority is None:
             return
         for ev in claim.evidence:
             if ev.author:
-                ev.source_authority = self._authority.get(ev.author)
+                ev.source_authority = self._authority.get(ev.author, topic=topic)
 
     def _find_duplicate(self, claim: Claim) -> Claim | None:
         """Check if a semantically equivalent claim already exists."""
