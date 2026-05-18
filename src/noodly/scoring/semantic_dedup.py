@@ -4,12 +4,29 @@ from __future__ import annotations
 
 import logging
 import math
+from dataclasses import dataclass, field
 
 from openai import AsyncOpenAI
 
 from noodly.models.claims import Claim
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class DedupResult:
+    """Result of semantic deduplication on a batch of claims."""
+
+    merged: list[tuple[Claim, Claim]] = field(default_factory=list)
+    unique: list[Claim] = field(default_factory=list)
+
+    @property
+    def merged_count(self) -> int:
+        return len(self.merged)
+
+    @property
+    def unique_count(self) -> int:
+        return len(self.unique)
 
 
 class SemanticDeduplicator:
@@ -84,12 +101,65 @@ class SemanticDeduplicator:
 
         Returns {new_claim_id: matching_existing_claim}.
         """
+        if not existing_claims or not new_claims:
+            return {}
+
+        # Pre-embed all existing claims in a single batch call
+        await self._embed_batch([self._claim_text(c) for c in existing_claims])
+        # Pre-embed all new claims in a single batch call
+        await self._embed_batch([self._claim_text(c) for c in new_claims])
+
         matches: dict[str, Claim] = {}
         for new_claim in new_claims:
             match = await self.find_duplicate(new_claim, existing_claims)
             if match:
                 matches[str(new_claim.id)] = match
         return matches
+
+    async def deduplicate_and_merge(
+        self,
+        new_claims: list[Claim],
+        existing_claims: list[Claim],
+    ) -> DedupResult:
+        """Find semantic duplicates and merge evidence into existing claims.
+
+        For each new claim that matches an existing claim:
+        - Merge evidence entries (avoiding duplicates by artifact_id)
+        - Boost confidence to max of both
+        - Update last_confirmed_at
+
+        Returns a DedupResult with merged pairs and unique (unmatched) claims.
+        """
+        from datetime import datetime, timezone
+
+        result = DedupResult()
+        if not new_claims:
+            return result
+
+        matches = await self.find_duplicates_batch(new_claims, existing_claims)
+
+        for new_claim in new_claims:
+            existing = matches.get(str(new_claim.id))
+            if existing is not None:
+                # Merge evidence
+                seen_artifacts = {str(ev.artifact_id) for ev in existing.evidence}
+                for ev in new_claim.evidence:
+                    if str(ev.artifact_id) not in seen_artifacts:
+                        existing.evidence.append(ev)
+                        seen_artifacts.add(str(ev.artifact_id))
+                existing.confidence = max(existing.confidence, new_claim.confidence)
+                existing.last_confirmed_at = datetime.now(timezone.utc)
+                result.merged.append((new_claim, existing))
+                logger.info(
+                    "Semantic merge: '%.50s' into existing claim %s (now %d evidence)",
+                    self._claim_text(new_claim),
+                    existing.id,
+                    len(existing.evidence),
+                )
+            else:
+                result.unique.append(new_claim)
+
+        return result
 
     async def similarity(self, claim_a: Claim, claim_b: Claim) -> float:
         """Calculate semantic similarity between two claims."""
@@ -115,6 +185,33 @@ class SemanticDeduplicator:
         except Exception:
             logger.exception("Embedding failed for text: %.60s", text)
             return []
+
+    async def _embed_batch(self, texts: list[str]) -> list[list[float]]:
+        """Embed multiple texts in a single API call for efficiency."""
+        uncached = [t for t in texts if t not in self._cache]
+        if not uncached:
+            return [self._cache[t] for t in texts]
+
+        # OpenAI supports up to 2048 inputs per batch call
+        batch_size = 2048
+        for i in range(0, len(uncached), batch_size):
+            batch = uncached[i : i + batch_size]
+            try:
+                response = await self._client.embeddings.create(
+                    model=self._model,
+                    input=batch,
+                )
+                for text, data in zip(batch, response.data):
+                    self._cache[text] = data.embedding
+            except Exception:
+                logger.exception(
+                    "Batch embedding failed for %d texts", len(batch)
+                )
+                for text in batch:
+                    if text not in self._cache:
+                        self._cache[text] = []
+
+        return [self._cache.get(t, []) for t in texts]
 
     @staticmethod
     def _claim_text(claim: Claim) -> str:

@@ -55,17 +55,50 @@ Rules:
 - Estimate confidence (0.0–1.0) based on how clearly the source states the fact.
 - Include the source_span — the exact text that supports the claim.
 - If the document contains no extractable facts, return an empty list.
-- For each claim, estimate valid_from and valid_until dates if the source text
-  indicates temporal boundaries. Use ISO 8601 format (YYYY-MM-DD). Use null if
-  the fact has no clear time boundary.
+
+Temporal extraction (IMPORTANT — populate dates aggressively):
+- For each claim, set valid_from and valid_until using ISO 8601 (YYYY-MM-DD).
+- Use the document's publication/issue date as valid_from when the claim describes
+  a state of affairs at that time (e.g., benchmark scores, versions, prices).
+- Use explicit dates from the text whenever available:
+  - "effective from 1 January 2024" → valid_from="2024-01-01"
+  - "published June 1999" → valid_from="1999-06-01"
+  - "until 31 December 2025" → valid_until="2025-12-31"
+  - "RFC 2616 was superseded in June 2014" → valid_until="2014-06-01"
+- For laws, regulations, circulars: use the issue/effective date as valid_from.
+- For academic papers: use the publication year as valid_from for benchmark claims.
+- For versioned documents (v1.0 superseded by v2.0): set valid_until on old version
+  claims to the date the new version was published.
+- Use null ONLY when the fact is truly timeless (e.g., mathematical definitions,
+  physical constants, permanent entity names).
+
+Supersession and document relationships:
+- When a document explicitly states it obsoletes, supersedes, replaces, updates,
+  or amends another document, extract that relationship:
+  - subject="[new doc]", predicate="supersedes"/"obsoletes"/"updates",
+    object="[old doc]"
+- When a circular/notice updates a previous one, extract:
+  - subject="[notice]", predicate="updates", object="[circular]"
+- When an RFC obsoletes another: subject="RFC XXXX", predicate="obsoletes",
+  object="RFC YYYY"
+- Set valid_until on the OLD document's claims to the date the new one took effect.
+
+Entity aliases and cross-references:
+- Extract entity aliases when mentioned. E.g., "Singapore Land Authority (SLA)"
+  → also emit: subject="SLA", predicate="is alias of",
+  object="Singapore Land Authority".
+- When a document references another document by name/number, extract that
+  reference: subject="[this doc]", predicate="references", object="[other doc]".
+
+Table extraction:
 - When extracting from tables, preserve the relationship between columns.
   E.g., "Product X | Price $100 | Q3 2024" → subject="Product X",
   predicate="has price", object="$100", valid_from="2024-07-01",
   valid_until="2024-09-30".
-- Extract entity aliases when mentioned. E.g., "Singapore Land Authority (SLA)"
-  → also emit: subject="SLA", predicate="is alias of",
-  object="Singapore Land Authority".
-- For process/workflow claims, preserve step ordering in the predicate or object.
+- Each table row should produce at least one claim.
+
+Process/workflow claims:
+- Preserve step ordering in the predicate or object.
 
 Return valid JSON matching the schema below.
 """
@@ -90,6 +123,22 @@ EXTRACTION_SCHEMA = {
                     "source_span": {"type": "string"},
                     "valid_from": {"type": ["string", "null"]},
                     "valid_until": {"type": ["string", "null"]},
+                    "entity_aliases": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "alias": {"type": "string"},
+                                "canonical": {"type": "string"},
+                            },
+                            "required": ["alias", "canonical"],
+                            "additionalProperties": False,
+                        },
+                    },
+                    "references": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
                 },
                 "required": [
                     "subject",
@@ -101,6 +150,8 @@ EXTRACTION_SCHEMA = {
                     "source_span",
                     "valid_from",
                     "valid_until",
+                    "entity_aliases",
+                    "references",
                 ],
                 "additionalProperties": False,
             },
@@ -109,6 +160,13 @@ EXTRACTION_SCHEMA = {
     "required": ["claims"],
     "additionalProperties": False,
 }
+
+
+class EntityAlias(BaseModel):
+    """An alias for an entity discovered during extraction."""
+
+    alias: str
+    canonical: str
 
 
 class ExtractedClaim(BaseModel):
@@ -123,6 +181,8 @@ class ExtractedClaim(BaseModel):
     source_span: str
     valid_from: str | None = None
     valid_until: str | None = None
+    entity_aliases: list[EntityAlias] = Field(default_factory=list)
+    references: list[str] = Field(default_factory=list)
 
 
 class ExtractionResult(BaseModel):
@@ -138,17 +198,22 @@ class ClaimExtractor:
         self._client = AsyncOpenAI(api_key=api_key)
         self._model = model
 
-    async def extract(self, artifact: SourceArtifact) -> list[Claim]:
+    async def extract(
+        self, artifact: SourceArtifact, source_filename: str = ""
+    ) -> list[Claim]:
         """Extract claims from a single source artifact."""
         if not artifact.body.strip():
             return []
 
         truncated_body = artifact.body[:8000]
 
+        # Build context header with source metadata
+        source_file = source_filename or artifact.source_uri or ""
         user_prompt = (
             f"Source: {artifact.source_type.value}\n"
             f"Title: {artifact.title}\n"
             f"Author: {artifact.author}\n"
+            f"Filename: {source_file}\n"
             f"Date: {artifact.content_created_at or artifact.created_at}\n\n"
             f"Content:\n{truncated_body}"
         )
@@ -186,6 +251,7 @@ class ClaimExtractor:
             return []
 
         claims: list[Claim] = []
+        source_file = source_filename or artifact.source_uri or ""
         for ec in result.claims:
             klass = KnowledgeClass.process
             try:
@@ -210,6 +276,7 @@ class ClaimExtractor:
                         artifact_id=artifact.id,
                         supports=True,
                         source_span=ec.source_span,
+                        source_artifact=source_file,
                         author=artifact.author,
                     )
                 ],
@@ -218,6 +285,30 @@ class ClaimExtractor:
                 valid_until=valid_until,
             )
             claims.append(claim)
+
+            # Generate alias claims from entity_aliases
+            for alias in ec.entity_aliases:
+                alias_claim = Claim(
+                    subject=alias.alias,
+                    predicate="is alias of",
+                    object=alias.canonical,
+                    natural_language=f"{alias.alias} is an alias for {alias.canonical}",
+                    confidence=0.95,
+                    knowledge_class=KnowledgeClass.stable,
+                    status=ClaimStatus.candidate,
+                    group_id=artifact.metadata.get("group_id", "default") or "default",
+                    evidence=[
+                        ClaimEvidence(
+                            artifact_id=artifact.id,
+                            supports=True,
+                            source_span=ec.source_span,
+                            source_artifact=source_file,
+                            author=artifact.author,
+                        )
+                    ],
+                    created_at=datetime.now(timezone.utc),
+                )
+                claims.append(alias_claim)
 
         logger.info(
             "Extracted %d claims from artifact %s (%s)",

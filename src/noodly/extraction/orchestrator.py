@@ -146,20 +146,33 @@ class ExtractionOrchestrator:
         artifact: SourceArtifact,
         source_path: Path | None,
     ) -> list[Claim]:
-        """Extract with both backends, pick the one with more claims."""
-        markitdown_claims = await self._extractor.extract(artifact)
+        """Extract with both backends, pick the best by quality score.
 
+        Uses ParsedDocument.quality_score to compare outputs, then falls
+        back to claim count if quality scores are tied.
+        """
         if source_path is None or not self._enable_docling:
-            return markitdown_claims
+            return await self._extractor.extract(artifact)
 
-        docling_claims = await self._extract_with_docling(artifact, source_path)
+        # Parse with both backends and compare quality
+        best_parsed = self._parser.parse_best(source_path)
 
-        if len(docling_claims) > len(markitdown_claims):
-            logger.info(
-                "Multi-mode: Docling (%d claims) wins over MarkItDown (%d claims)",
-                len(docling_claims),
-                len(markitdown_claims),
-            )
-            return docling_claims
+        modified_artifact = SourceArtifact(
+            id=artifact.id,
+            source_type=artifact.source_type,
+            source_uri=artifact.source_uri,
+            title=best_parsed.title or artifact.title,
+            body=best_parsed.markdown,
+            author=artifact.author,
+            content_hash=artifact.content_hash,
+            metadata={
+                **artifact.metadata,
+                "parser_backend": best_parsed.metadata.get("parser_backend", "markitdown"),
+                "parser_comparison": best_parsed.metadata.get("parser_comparison", ""),
+            },
+        )
 
-        return markitdown_claims
+        source_file = source_path.name if source_path else ""
+        return await self._extractor.extract(
+            modified_artifact, source_filename=source_file
+        )
