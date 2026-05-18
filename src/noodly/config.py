@@ -30,6 +30,12 @@ class Settings(BaseSettings):
     # Graph
     group_id: str = "default"
 
+    # Phase 3: parsing & agents
+    enable_qa_agent: bool = False
+    enable_graph_agent: bool = False
+    chunk_size: int = 6000
+    qa_change_threshold: float = 0.05
+
 
 def get_settings() -> Settings:
     """Return cached settings instance."""

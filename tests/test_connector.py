@@ -88,11 +88,11 @@ async def test_hashes_json_skipped(tmp_inbox):
 
 @pytest.mark.asyncio
 async def test_unsupported_extension_skipped(tmp_inbox):
-    (tmp_inbox / "image.png").write_bytes(b"\x89PNG")
+    (tmp_inbox / "binary.exe").write_bytes(b"\x00\x01\x02")
     connector = LocalFSConnector(tmp_inbox)
     artifacts = await connector.scan()
     titles = {a.title for a in artifacts}
-    assert "image.png" not in titles
+    assert "binary.exe" not in titles
 
 
 @pytest.mark.asyncio

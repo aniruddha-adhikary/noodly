@@ -16,34 +16,19 @@ from noodly.models.artifacts import SourceArtifact, SourceType
 logger = logging.getLogger(__name__)
 
 SUPPORTED_EXTENSIONS = {
-    ".txt",
-    ".md",
-    ".markdown",
-    ".rst",
-    ".json",
-    ".yaml",
-    ".yml",
-    ".csv",
-    ".tsv",
-    ".xml",
-    ".html",
-    ".htm",
-    ".py",
-    ".js",
-    ".ts",
-    ".go",
-    ".rs",
-    ".java",
-    ".c",
-    ".cpp",
-    ".h",
-    ".sh",
-    ".toml",
-    ".ini",
-    ".cfg",
-    ".conf",
-    ".log",
-    ".tex",
+    # Text
+    ".txt", ".md", ".markdown", ".rst", ".json", ".yaml", ".yml",
+    ".csv", ".tsv", ".xml", ".html", ".htm", ".tex",
+    # Code
+    ".py", ".js", ".ts", ".go", ".rs", ".java", ".c", ".cpp", ".h", ".sh",
+    # Config
+    ".toml", ".ini", ".cfg", ".conf", ".log",
+    # Documents (MarkItDown-supported)
+    ".pdf", ".docx", ".doc", ".pptx", ".ppt", ".xlsx", ".xls",
+    # Media (MarkItDown-supported)
+    ".wav", ".mp3", ".jpg", ".jpeg", ".png",
+    # Archives & email
+    ".zip", ".msg", ".eml",
 }
 
 

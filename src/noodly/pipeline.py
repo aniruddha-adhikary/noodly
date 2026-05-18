@@ -3,28 +3,34 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
+from noodly.caching.manager import CacheManager
 from noodly.config import Settings
 from noodly.connectors.local_fs import LocalFSConnector
 from noodly.extraction.extractor import ClaimExtractor
 from noodly.graph.brain import Brain
 from noodly.models.artifacts import SourceArtifact
+from noodly.models.claims import Claim, ClaimEvidence, ClaimStatus, KnowledgeClass
+from noodly.parsing.boilerplate import BoilerplateStripper
+from noodly.parsing.chunker import chunk_markdown, content_hash
+from noodly.parsing.parser import DocumentParser
 from noodly.projection.markdown import MarkdownProjector
 from noodly.scoring.authority import AuthorityRegistry
 from noodly.scoring.ledger import FactLedger
+from noodly.tracking.changelog import ChangeEvent, ChangeLog, ChangeType
+from noodly.tracking.claim_differ import ClaimDiffer
+from noodly.tracking.content_differ import ContentDiffer
 
 logger = logging.getLogger(__name__)
 
 
 class Pipeline:
-    """End-to-end ingest → extract → store → project pipeline.
+    """End-to-end ingest → parse → diff → extract → enrich → project pipeline.
 
-    Usage::
-
-        pipeline = Pipeline(settings)
-        await pipeline.initialize()
-        stats = await pipeline.run()
-        await pipeline.close()
+    Phase 3 adds multi-format parsing, section-aware chunking, content diff
+    tracking, boilerplate stripping, extraction caching, diff-aware agents,
+    and an append-only change log.
     """
 
     def __init__(self, settings: Settings) -> None:
@@ -42,55 +48,260 @@ class Pipeline:
         )
         self._projector = MarkdownProjector(settings.brain_dir)
 
+        # Phase 3 modules
+        cache_dir = settings.brain_dir / ".cache"
+        self._parser = DocumentParser()
+        self._boilerplate = BoilerplateStripper()
+        self._cache = CacheManager(cache_dir)
+        self._content_differ = ContentDiffer(settings.brain_dir / ".content_cache")
+        self._claim_differ = ClaimDiffer()
+        self._changelog = ChangeLog(settings.brain_dir / "changelog.json")
+        self._chunk_size = settings.chunk_size
+
     async def initialize(self) -> None:
         """Set up graph indices."""
         await self._brain.initialize()
         logger.info("Pipeline initialized")
 
     async def run(self) -> dict[str, int]:
-        """Run one full cycle: scan → ingest → extract → score → project."""
-        stats = {"artifacts": 0, "claims": 0, "projected": 0}
+        """Run one full cycle: scan → parse → diff → extract → enrich → project."""
+        stats = {"artifacts": 0, "claims": 0, "projected": 0, "cached_chunks": 0}
 
-        # 1. Scan for new files
         artifacts = await self._connector.scan()
         stats["artifacts"] = len(artifacts)
         if not artifacts:
             logger.info("No new artifacts found")
             return stats
 
-        all_claims = []
+        all_claims: list[Claim] = []
         for artifact in artifacts:
-            # 2. Ingest into Graphiti
-            try:
-                await self._brain.ingest_artifact(artifact)
-            except Exception:
-                logger.exception("Failed to ingest artifact %s", artifact.id)
+            claims, cached = await self._process_artifact(artifact)
+            all_claims.extend(claims)
+            stats["cached_chunks"] += cached
 
-            # 3. Extract claims via LLM
-            try:
-                claims = await self._extractor.extract(artifact)
-                all_claims.extend(claims)
-            except Exception:
-                logger.exception("Failed to extract claims from %s", artifact.id)
-
-        # 4. Store claims in ledger
         stored = self._ledger.add_claims(all_claims)
         stats["claims"] = len(stored)
 
-        # 5. Apply decay
         self._ledger.apply_decay()
 
-        # 6. Project to Markdown
+        if self._settings.enable_graph_agent and all_claims:
+            await self._run_graph_agent(all_claims)
+
         all_ledger_claims = self._ledger.list_claims(limit=10000)
         stats["projected"] = self._projector.project(all_ledger_claims)
 
         logger.info(
-            "Pipeline complete: %d artifacts, %d claims, %d files projected",
+            "Pipeline complete: %d artifacts, %d claims (%d cached), %d projected",
             stats["artifacts"],
             stats["claims"],
+            stats["cached_chunks"],
             stats["projected"],
         )
         return stats
+
+    async def _process_artifact(self, artifact: SourceArtifact) -> tuple[list[Claim], int]:
+        """Process a single artifact through parse → diff → extract."""
+        source_uri = artifact.source_uri or str(artifact.id)
+        file_hash = artifact.metadata.get("content_hash", "")
+
+        # 1. Parse (use cache if available)
+        markdown = artifact.body
+        if artifact.source_uri and Path(artifact.source_uri).exists():
+            path = Path(artifact.source_uri)
+            if self._parser.can_parse(path):
+                cached_doc = self._cache.parse.get(file_hash) if file_hash else None
+                if cached_doc is not None:
+                    markdown = cached_doc.markdown
+                else:
+                    parsed = self._parser.parse(path)
+                    markdown = parsed.markdown
+                    if file_hash:
+                        self._cache.parse.put(file_hash, parsed)
+
+        # 2. Strip boilerplate
+        markdown = self._boilerplate.strip(markdown)
+
+        # 3. Content diff
+        content_diff = self._content_differ.diff(source_uri, markdown, file_hash)
+
+        if content_diff.is_new:
+            self._changelog.emit(
+                ChangeEvent(
+                    change_type=ChangeType.document_added,
+                    source_uri=source_uri,
+                    payload={"title": artifact.title, "sections": len(content_diff.added_sections)},
+                )
+            )
+        elif content_diff.change_ratio > 0:
+            self._changelog.emit(
+                ChangeEvent(
+                    change_type=ChangeType.document_modified,
+                    source_uri=source_uri,
+                    payload={
+                        "change_ratio": round(content_diff.change_ratio, 3),
+                        "summary": content_diff.summary,
+                    },
+                )
+            )
+
+        # 4. QA agent (optional)
+        if (
+            self._settings.enable_qa_agent
+            and content_diff.change_ratio >= self._settings.qa_change_threshold
+        ):
+            await self._run_qa_agent(artifact, markdown, content_diff)
+
+        # 5. Ingest into Graphiti
+        try:
+            artifact.body = markdown
+            await self._brain.ingest_artifact(artifact)
+        except Exception:
+            logger.exception("Failed to ingest artifact %s", artifact.id)
+
+        # 6. Chunk and extract (with caching)
+        chunks = chunk_markdown(markdown, max_chars=self._chunk_size)
+        all_claims: list[Claim] = []
+        cached_count = 0
+
+        for chunk in chunks:
+            chunk_hash = content_hash(chunk.content)
+            cached_claims_data = self._cache.extraction.get(chunk_hash)
+
+            if cached_claims_data is not None:
+                claims = self._deserialize_cached_claims(cached_claims_data, artifact)
+                all_claims.extend(claims)
+                cached_count += 1
+                continue
+
+            try:
+                chunk_artifact = SourceArtifact(
+                    source_type=artifact.source_type,
+                    source_uri=artifact.source_uri,
+                    title=f"{artifact.title} [{chunk.heading or f'chunk-{chunk.index}'}]",
+                    body=chunk.content,
+                    author=artifact.author,
+                    content_created_at=artifact.content_created_at,
+                    metadata=artifact.metadata,
+                    id=artifact.id,
+                )
+                claims = await self._extractor.extract(chunk_artifact)
+                all_claims.extend(claims)
+
+                self._cache.extraction.put(
+                    chunk_hash,
+                    [
+                        {
+                            "subject": c.subject,
+                            "predicate": c.predicate,
+                            "object": c.object,
+                            "natural_language": c.natural_language,
+                            "knowledge_class": c.knowledge_class.value,
+                            "confidence": c.confidence,
+                            "source_span": c.evidence[0].source_span if c.evidence else "",
+                        }
+                        for c in claims
+                    ],
+                )
+            except Exception:
+                logger.exception("Failed to extract claims from chunk %d", chunk.index)
+
+        for claim in all_claims:
+            self._changelog.emit(
+                ChangeEvent(
+                    change_type=ChangeType.claim_added,
+                    entity_id=claim.subject,
+                    source_uri=source_uri,
+                    payload={"predicate": claim.predicate, "object": claim.object},
+                )
+            )
+
+        return all_claims, cached_count
+
+    def _deserialize_cached_claims(
+        self, claims_data: list[dict], artifact: SourceArtifact
+    ) -> list[Claim]:
+        """Reconstruct Claim objects from cached extraction data."""
+        claims: list[Claim] = []
+        for data in claims_data:
+            klass = KnowledgeClass.process
+            try:
+                klass = KnowledgeClass(data.get("knowledge_class", "process"))
+            except ValueError:
+                pass
+
+            claim = Claim(
+                subject=data["subject"],
+                predicate=data["predicate"],
+                object=data["object"],
+                natural_language=data.get("natural_language", ""),
+                confidence=data.get("confidence", 0.5),
+                knowledge_class=klass,
+                status=ClaimStatus.candidate,
+                evidence=[
+                    ClaimEvidence(
+                        artifact_id=artifact.id,
+                        supports=True,
+                        source_span=data.get("source_span", ""),
+                        author=artifact.author,
+                    )
+                ],
+            )
+            claims.append(claim)
+        return claims
+
+    async def _run_qa_agent(self, artifact, markdown, content_diff) -> None:
+        """Run QA agent on the parsed output."""
+        try:
+            from noodly.agents.qa_agent import ExtractionQAAgent
+            from noodly.parsing.parser import ParsedDocument
+
+            agent = ExtractionQAAgent(
+                api_key=self._settings.openai_api_key,
+                model=self._settings.openai_model,
+            )
+            parsed = ParsedDocument(
+                title=artifact.title,
+                markdown=markdown,
+                source_format=artifact.metadata.get("mime_type", ""),
+            )
+            result = await agent.review(parsed, content_diff)
+            if result.issues:
+                logger.warning(
+                    "QA found %d issues in %s (quality: %s)",
+                    len(result.issues),
+                    artifact.title,
+                    result.overall_quality,
+                )
+                for issue in result.issues:
+                    logger.warning(
+                        "  [%s] %s: %s", issue.severity, issue.section, issue.description
+                    )
+        except Exception:
+            logger.exception("QA agent failed for %s", artifact.title)
+
+    async def _run_graph_agent(self, new_claims) -> None:
+        """Run graph population agent on new claims."""
+        try:
+            from noodly.agents.graph_agent import GraphPopulationAgent
+            from noodly.agents.toolkit import AgentToolkit
+
+            toolkit = AgentToolkit(
+                ledger=self._ledger,
+                changelog=self._changelog,
+                cache=self._cache,
+            )
+            agent = GraphPopulationAgent(
+                api_key=self._settings.openai_api_key,
+                model=self._settings.openai_model,
+                toolkit=toolkit,
+                ledger=self._ledger,
+                changelog=self._changelog,
+            )
+            report = await agent.enrich(new_claims=new_claims)
+            if report.has_actions:
+                logger.info("Graph agent: %s", report.summary)
+        except Exception:
+            logger.exception("Graph agent failed")
 
     async def ingest_text(self, title: str, body: str, author: str = "") -> dict[str, int]:
         """Ingest raw text directly (useful for CLI and testing)."""
