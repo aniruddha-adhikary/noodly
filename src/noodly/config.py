@@ -59,6 +59,19 @@ class Settings(BaseSettings):
     enable_docling: bool = False
     extraction_mode: str = "auto"  # auto, markitdown, docling, multi
 
+    # Phase 7: parallel LLM dispatch
+    llm_max_concurrent: int = 8
+    llm_rate_limit_rpm: int = 500
+    llm_retry_max: int = 3
+    llm_request_timeout: float = 30.0
+
+    # Phase 7: emission planning
+    emission_mode: str = "incremental"  # incremental | full
+
+    # Phase 7: topic clustering
+    enable_topic_clustering: bool = True
+    topic_model: str = "gpt-4o-mini"
+
     # Phase 4: GitLab integration
     gitlab_url: str = "https://gitlab.com"
     gitlab_token: str = ""
@@ -67,6 +80,9 @@ class Settings(BaseSettings):
     gitlab_knowledge_path: str = "knowledge"
     enable_gitlab_handler: bool = False
     enable_gitlab_projection: bool = False
+
+    # Phase 7: topic-aware authority
+    authority_topic_inference: str = "llm"  # llm | keyword
 
 
 def get_settings() -> Settings:
