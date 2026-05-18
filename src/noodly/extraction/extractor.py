@@ -19,6 +19,24 @@ from noodly.models.claims import (
 
 logger = logging.getLogger(__name__)
 
+
+def _parse_date(date_str: str) -> datetime | None:
+    """Parse an ISO date string into a datetime, with fallback."""
+    if not date_str or date_str.lower() in ("null", "none", "n/a", ""):
+        return None
+    try:
+        dt = datetime.fromisoformat(date_str)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except ValueError:
+        try:
+            dt = datetime.strptime(date_str, "%Y-%m-%d")
+            return dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            logger.debug("Could not parse date: %s", date_str)
+            return None
+
 EXTRACTION_SYSTEM_PROMPT = """\
 You are a knowledge extraction engine for a Company Brain system.
 
@@ -37,6 +55,17 @@ Rules:
 - Estimate confidence (0.0–1.0) based on how clearly the source states the fact.
 - Include the source_span — the exact text that supports the claim.
 - If the document contains no extractable facts, return an empty list.
+- For each claim, estimate valid_from and valid_until dates if the source text
+  indicates temporal boundaries. Use ISO 8601 format (YYYY-MM-DD). Use null if
+  the fact has no clear time boundary.
+- When extracting from tables, preserve the relationship between columns.
+  E.g., "Product X | Price $100 | Q3 2024" → subject="Product X",
+  predicate="has price", object="$100", valid_from="2024-07-01",
+  valid_until="2024-09-30".
+- Extract entity aliases when mentioned. E.g., "Singapore Land Authority (SLA)"
+  → also emit: subject="SLA", predicate="is alias of",
+  object="Singapore Land Authority".
+- For process/workflow claims, preserve step ordering in the predicate or object.
 
 Return valid JSON matching the schema below.
 """
@@ -59,6 +88,8 @@ EXTRACTION_SCHEMA = {
                     },
                     "confidence": {"type": "number"},
                     "source_span": {"type": "string"},
+                    "valid_from": {"type": ["string", "null"]},
+                    "valid_until": {"type": ["string", "null"]},
                 },
                 "required": [
                     "subject",
@@ -68,6 +99,8 @@ EXTRACTION_SCHEMA = {
                     "knowledge_class",
                     "confidence",
                     "source_span",
+                    "valid_from",
+                    "valid_until",
                 ],
                 "additionalProperties": False,
             },
@@ -88,6 +121,8 @@ class ExtractedClaim(BaseModel):
     knowledge_class: str
     confidence: float
     source_span: str
+    valid_from: str | None = None
+    valid_until: str | None = None
 
 
 class ExtractionResult(BaseModel):
@@ -158,6 +193,9 @@ class ClaimExtractor:
             except ValueError:
                 pass
 
+            valid_from = _parse_date(ec.valid_from) if ec.valid_from else None
+            valid_until = _parse_date(ec.valid_until) if ec.valid_until else None
+
             claim = Claim(
                 subject=ec.subject,
                 predicate=ec.predicate,
@@ -176,6 +214,8 @@ class ClaimExtractor:
                     )
                 ],
                 created_at=datetime.now(timezone.utc),
+                valid_from=valid_from,
+                valid_until=valid_until,
             )
             claims.append(claim)
 

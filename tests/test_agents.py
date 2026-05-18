@@ -3,16 +3,14 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from uuid import uuid4
 
 from noodly.agents.compact_serializer import CompactSerializer
 from noodly.agents.context_scoper import ContextScoper
 from noodly.agents.model_router import get_model
 from noodly.agents.toolkit import TOOL_DEFINITIONS, AgentToolkit
 from noodly.caching.manager import CacheManager
-from noodly.models.claims import Claim, ClaimEvidence, KnowledgeClass
+from noodly.models.claims import Claim, KnowledgeClass
 from noodly.scoring.ledger import FactLedger
 from noodly.tracking.changelog import ChangeEvent, ChangeLog, ChangeType
 

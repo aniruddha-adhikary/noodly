@@ -351,6 +351,180 @@ def changelog(limit: int, source: str) -> None:
 
 
 @cli.group()
+def conflicts() -> None:
+    """Manage conflict detection and resolution."""
+
+
+@conflicts.command(name="list")
+@click.option("--limit", "-n", default=20, help="Maximum results")
+def conflicts_list(limit: int) -> None:
+    """List detected conflicts and their resolution status."""
+    from noodly.resolution.audit import ResolutionAudit
+
+    settings = get_settings()
+    audit = ResolutionAudit(settings.brain_dir / "resolutions.json")
+    resolutions = audit.list_resolutions(limit=limit)
+
+    if not resolutions:
+        console.print("[yellow]No conflict resolutions recorded.[/yellow]")
+        return
+
+    table = Table(title=f"Conflict Resolutions ({len(resolutions)})")
+    table.add_column("ID", style="dim")
+    table.add_column("Strategy", style="cyan")
+    table.add_column("Resolved By")
+    table.add_column("Confidence", justify="right")
+    table.add_column("Winner", style="green")
+    table.add_column("Date", style="dim")
+
+    for r in resolutions:
+        table.add_row(
+            str(r.conflict_id)[:8],
+            r.strategy_used,
+            r.resolved_by,
+            f"{r.confidence:.3f}",
+            str(r.winner_id)[:8] if r.winner_id else "pending",
+            r.resolved_at.strftime("%Y-%m-%d %H:%M"),
+        )
+
+    console.print(table)
+
+
+@conflicts.command(name="detect")
+def conflicts_detect() -> None:
+    """Detect conflicts among existing claims."""
+    from noodly.resolution.detector import ConflictDetector
+    from noodly.scoring.ledger import FactLedger
+
+    settings = get_settings()
+    ledger = FactLedger(settings.brain_dir / "ledger.json")
+    detector = ConflictDetector(
+        similarity_threshold=settings.conflict_similarity_threshold,
+    )
+
+    all_claims = ledger.list_claims(limit=10000)
+    conflicts_found = detector.detect_within(all_claims)
+
+    if not conflicts_found:
+        console.print("[green]No conflicts detected.[/green]")
+        return
+
+    table = Table(title=f"Detected Conflicts ({len(conflicts_found)})")
+    table.add_column("Subject", style="cyan")
+    table.add_column("Predicate")
+    table.add_column("Value A", style="green")
+    table.add_column("Value B", style="red")
+    table.add_column("Score Delta", justify="right")
+
+    for c in conflicts_found:
+        table.add_row(
+            c.claim_a.subject[:30],
+            c.claim_a.predicate[:30],
+            c.claim_a.object[:30],
+            c.claim_b.object[:30],
+            f"{c.score_delta:.3f}",
+        )
+
+    console.print(table)
+
+
+@conflicts.command(name="resolve")
+@click.option("--auto-threshold", "-t", type=float, default=None,
+              help="Override auto-resolve threshold")
+@click.option("--strategy", "-s", type=click.Choice(
+    ["authority_wins", "recency_wins", "majority_wins", "higher_score"]),
+    default=None, help="Override resolution strategy")
+def conflicts_resolve(auto_threshold: float | None, strategy: str | None) -> None:
+    """Detect and resolve conflicts among existing claims."""
+    from noodly.resolution.audit import ResolutionAudit
+    from noodly.resolution.detector import ConflictDetector
+    from noodly.resolution.resolver import ConflictResolver
+    from noodly.resolution.strategies import AutoResolveStrategy
+    from noodly.scoring.authority import AuthorityRegistry
+    from noodly.scoring.ledger import FactLedger
+    from noodly.tracking.changelog import ChangeLog
+
+    settings = get_settings()
+    authority = AuthorityRegistry(settings.brain_dir / "authority.json")
+    ledger = FactLedger(settings.brain_dir / "ledger.json", authority_registry=authority)
+    audit = ResolutionAudit(settings.brain_dir / "resolutions.json")
+    changelog = ChangeLog(settings.brain_dir / "changelog.json")
+
+    threshold = auto_threshold if auto_threshold is not None else settings.auto_resolve_threshold
+    strat_str = strategy or settings.resolve_strategy
+    try:
+        strat = AutoResolveStrategy(strat_str)
+    except ValueError:
+        strat = AutoResolveStrategy.AUTHORITY_WINS
+
+    detector = ConflictDetector(
+        similarity_threshold=settings.conflict_similarity_threshold,
+    )
+    resolver = ConflictResolver(
+        ledger=ledger,
+        audit=audit,
+        changelog=changelog,
+        auto_threshold=threshold,
+        strategy=strat,
+    )
+
+    all_claims = ledger.list_claims(limit=10000)
+    conflicts_found = detector.detect_within(all_claims)
+
+    if not conflicts_found:
+        console.print("[green]No conflicts detected.[/green]")
+        return
+
+    console.print(f"Found {len(conflicts_found)} conflicts. Resolving...")
+
+    async def _resolve():
+        return await resolver.resolve_batch(conflicts_found)
+
+    resolutions = _run(_resolve())
+
+    auto = sum(1 for r in resolutions if r.winner_id is not None)
+    manual = sum(1 for r in resolutions if r.winner_id is None)
+    console.print(
+        f"[green]Resolved:[/green] {auto} auto-resolved, {manual} pending manual review"
+    )
+
+
+@cli.group()
+def dispatch() -> None:
+    """Event dispatch system management."""
+
+
+@dispatch.command(name="stats")
+def dispatch_stats() -> None:
+    """Show event dispatch and audit statistics."""
+    import json
+
+    settings = get_settings()
+    audit_path = settings.brain_dir / "audit.jsonl"
+    resolutions_path = settings.brain_dir / "resolutions.json"
+
+    console.print("\n[bold]Event Dispatch Stats[/bold]")
+
+    if audit_path.exists():
+        line_count = sum(1 for _ in open(audit_path))
+        console.print(f"  Audit log entries: {line_count}")
+    else:
+        console.print("  Audit log: not started")
+
+    if resolutions_path.exists():
+        try:
+            data = json.loads(resolutions_path.read_text())
+            total = len(data)
+            pending = sum(1 for r in data if r.get("winner_id") is None)
+            console.print(f"  Total resolutions: {total}")
+            console.print(f"  Pending manual: {pending}")
+        except (json.JSONDecodeError, Exception):
+            console.print("  Resolutions file: corrupt")
+    else:
+        console.print("  Resolutions: none")
+
+
+@cli.group()
 def cache() -> None:
     """Manage caches (parse, extraction, agent decisions)."""
 

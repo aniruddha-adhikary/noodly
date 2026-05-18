@@ -7,9 +7,8 @@ from pathlib import Path
 import pytest
 
 from noodly.parsing.boilerplate import BoilerplateStripper
-from noodly.parsing.chunker import Chunk, chunk_markdown, content_hash, get_section_headings
+from noodly.parsing.chunker import chunk_markdown, content_hash, get_section_headings
 from noodly.parsing.parser import DocumentParser, ParsedDocument
-
 
 # --- ParsedDocument ---
 
