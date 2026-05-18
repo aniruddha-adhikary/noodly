@@ -27,6 +27,7 @@ async def _get_brain() -> Brain:
     if _brain is None:
         settings = get_settings()
         _brain = Brain(settings)
+        await _brain.initialize()
     return _brain
 
 
