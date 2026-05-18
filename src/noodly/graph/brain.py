@@ -6,7 +6,9 @@ import json
 import logging
 
 from graphiti_core import Graphiti
+from graphiti_core.cross_encoder.openai_reranker_client import OpenAIRerankerClient
 from graphiti_core.driver.falkordb_driver import FalkorDriver
+from graphiti_core.embedder.openai import OpenAIEmbedder, OpenAIEmbedderConfig
 from graphiti_core.llm_client import OpenAIClient
 from graphiti_core.llm_client.config import LLMConfig
 from graphiti_core.nodes import EpisodeType
@@ -47,7 +49,15 @@ class Brain:
             model=settings.openai_model,
         )
         llm_client = OpenAIClient(config=llm_config)
-        self._graphiti = Graphiti(graph_driver=driver, llm_client=llm_client)
+        embedder_config = OpenAIEmbedderConfig(api_key=settings.openai_api_key)
+        embedder = OpenAIEmbedder(config=embedder_config)
+        cross_encoder = OpenAIRerankerClient(config=llm_config)
+        self._graphiti = Graphiti(
+            graph_driver=driver,
+            llm_client=llm_client,
+            embedder=embedder,
+            cross_encoder=cross_encoder,
+        )
 
     async def initialize(self) -> None:
         """Set up graph indices. Call once on first run."""
