@@ -52,7 +52,8 @@ class FactLedger:
             self._backend = backend
 
         self._claims: dict[str, Claim] = {}
-        self._load()
+        if not self.is_async_backend:
+            self._load()
 
     def _load(self) -> None:
         self._claims = self._backend.load_claims()
