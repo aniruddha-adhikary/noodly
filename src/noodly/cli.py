@@ -312,3 +312,85 @@ def authority_remove(source: str) -> None:
         console.print(f"[green]Removed {source}[/green]")
     else:
         console.print(f"[yellow]{source} not found in registry[/yellow]")
+
+
+@cli.command()
+@click.option("--limit", "-n", default=30, help="Maximum events to show")
+@click.option("--source", "-s", default="", help="Filter by source URI")
+def changelog(limit: int, source: str) -> None:
+    """Show the change log (append-only event history)."""
+    from noodly.tracking.changelog import ChangeLog
+
+    settings = get_settings()
+    log = ChangeLog(settings.brain_dir / "changelog.json")
+
+    if source:
+        events = log.for_source(source)
+    else:
+        events = log.recent(limit=limit)
+
+    if not events:
+        console.print("[yellow]No change events found.[/yellow]")
+        return
+
+    table = Table(title=f"Change Log ({len(events)} events)")
+    table.add_column("Time", style="dim")
+    table.add_column("Type", style="cyan")
+    table.add_column("Entity/Source", style="green")
+    table.add_column("Agent")
+
+    for event in events:
+        table.add_row(
+            event.timestamp.strftime("%Y-%m-%d %H:%M"),
+            event.change_type.value,
+            event.entity_id or event.source_uri[:50],
+            event.agent or "-",
+        )
+
+    console.print(table)
+
+
+@cli.group()
+def cache() -> None:
+    """Manage caches (parse, extraction, agent decisions)."""
+
+
+@cache.command(name="stats")
+def cache_stats() -> None:
+    """Show cache statistics."""
+    from noodly.caching.manager import CacheManager
+
+    settings = get_settings()
+    mgr = CacheManager(settings.brain_dir / ".cache")
+
+    content_count = len(list((settings.brain_dir / ".cache" / "content").glob("*.md")))
+    extraction_count = len(list((settings.brain_dir / ".cache" / "extractions").glob("*.json")))
+
+    console.print("\n[bold]Cache Stats[/bold]")
+    console.print(f"  Parse cache entries: {content_count}")
+    console.print(f"  Extraction cache entries: {extraction_count}")
+    console.print(f"  Agent decision merges: {mgr.decisions.merge_count}")
+
+
+@cache.command(name="clear")
+@click.option("--level", type=click.Choice(["parse", "extraction", "all"]), default="all")
+def cache_clear(level: str) -> None:
+    """Clear cached data."""
+    import shutil
+
+    settings = get_settings()
+    cache_dir = settings.brain_dir / ".cache"
+
+    if level in ("parse", "all"):
+        content_dir = cache_dir / "content"
+        if content_dir.exists():
+            shutil.rmtree(content_dir)
+            content_dir.mkdir(parents=True, exist_ok=True)
+            console.print("[green]Parse cache cleared.[/green]")
+
+    if level in ("extraction", "all"):
+        from noodly.caching.manager import CacheManager
+
+        mgr = CacheManager(cache_dir)
+        removed = mgr.extraction.invalidate_all()
+        console.print(f"[green]Extraction cache cleared ({removed} entries).[/green]")
