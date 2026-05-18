@@ -8,6 +8,8 @@ from pathlib import Path
 from noodly.caching.manager import CacheManager
 from noodly.config import Settings
 from noodly.connectors.local_fs import LocalFSConnector
+from noodly.dispatch.dispatcher import EventDispatcher
+from noodly.dispatch.handlers import AuditLogHandler, ConflictEscalationHandler
 from noodly.extraction.extractor import ClaimExtractor
 from noodly.graph.brain import Brain
 from noodly.models.artifacts import SourceArtifact
@@ -16,6 +18,10 @@ from noodly.parsing.boilerplate import BoilerplateStripper
 from noodly.parsing.chunker import chunk_markdown, content_hash
 from noodly.parsing.parser import DocumentParser
 from noodly.projection.markdown import MarkdownProjector
+from noodly.resolution.audit import ResolutionAudit
+from noodly.resolution.detector import ConflictDetector
+from noodly.resolution.resolver import ConflictResolver
+from noodly.resolution.strategies import AutoResolveStrategy
 from noodly.scoring.authority import AuthorityRegistry
 from noodly.scoring.ledger import FactLedger
 from noodly.tracking.changelog import ChangeEvent, ChangeLog, ChangeType
@@ -50,13 +56,80 @@ class Pipeline:
 
         # Phase 3 modules
         cache_dir = settings.brain_dir / ".cache"
-        self._parser = DocumentParser()
+        self._parser = DocumentParser(enable_docling=settings.enable_docling)
         self._boilerplate = BoilerplateStripper()
         self._cache = CacheManager(cache_dir)
         self._content_differ = ContentDiffer(settings.brain_dir / ".content_cache")
         self._claim_differ = ClaimDiffer()
         self._changelog = ChangeLog(settings.brain_dir / "changelog.json")
         self._chunk_size = settings.chunk_size
+
+        # Phase 4: event dispatch
+        self._dispatcher = EventDispatcher()
+        if settings.enable_event_dispatch:
+            audit_path = (
+                Path(settings.audit_log_path)
+                if settings.audit_log_path
+                else settings.brain_dir / "audit.jsonl"
+            )
+            self._dispatcher.register(AuditLogHandler(audit_path=audit_path))
+
+        # Phase 4: conflict resolution
+        self._resolution_audit = ResolutionAudit(
+            settings.brain_dir / "resolutions.json"
+        )
+        self._conflict_resolver: ConflictResolver | None = None
+        self._conflict_detector: ConflictDetector | None = None
+        if settings.enable_conflict_resolution:
+            try:
+                strategy = AutoResolveStrategy(settings.resolve_strategy)
+            except ValueError:
+                strategy = AutoResolveStrategy.AUTHORITY_WINS
+
+            gitlab_handler = None
+            if settings.enable_gitlab_handler and settings.gitlab_token:
+                from noodly.dispatch.gitlab_handler import GitLabConfig, GitLabMRHandler
+
+                gitlab_config = GitLabConfig(
+                    url=settings.gitlab_url,
+                    token=settings.gitlab_token,
+                    project_id=settings.gitlab_project_id,
+                    target_branch=settings.gitlab_target_branch,
+                    knowledge_path=settings.gitlab_knowledge_path,
+                )
+                gitlab_handler = GitLabMRHandler(gitlab_config)
+                self._dispatcher.register(
+                    gitlab_handler,
+                    event_types=[ChangeType.conflict_detected],
+                )
+
+            self._conflict_resolver = ConflictResolver(
+                ledger=self._ledger,
+                audit=self._resolution_audit,
+                changelog=self._changelog,
+                auto_threshold=settings.auto_resolve_threshold,
+                strategy=strategy,
+                similarity_threshold=settings.conflict_similarity_threshold,
+                manual_handler=gitlab_handler,
+            )
+            self._conflict_detector = ConflictDetector(
+                similarity_threshold=settings.conflict_similarity_threshold,
+            )
+            self._dispatcher.register(
+                ConflictEscalationHandler(resolver=self._conflict_resolver),
+                event_types=[ChangeType.conflict_detected],
+            )
+
+        # Phase 4: semantic dedup
+        self._semantic_dedup = None
+        if settings.enable_semantic_dedup and settings.openai_api_key:
+            from noodly.scoring.semantic_dedup import SemanticDeduplicator
+
+            self._semantic_dedup = SemanticDeduplicator(
+                api_key=settings.openai_api_key,
+                model=settings.embedding_model,
+                threshold=settings.semantic_dedup_threshold,
+            )
 
     async def initialize(self) -> None:
         """Set up graph indices."""
@@ -79,10 +152,36 @@ class Pipeline:
             all_claims.extend(claims)
             stats["cached_chunks"] += cached
 
+        # Phase 4: semantic dedup before storing
+        if self._semantic_dedup is not None and all_claims:
+            existing = self._ledger.list_claims(limit=10000)
+            dedup_matches = await self._semantic_dedup.find_duplicates_batch(
+                all_claims, existing
+            )
+            if dedup_matches:
+                logger.info(
+                    "Semantic dedup: %d claims matched existing entries",
+                    len(dedup_matches),
+                )
+
         stored = self._ledger.add_claims(all_claims)
         stats["claims"] = len(stored)
 
         self._ledger.apply_decay()
+
+        # Phase 4: conflict detection + resolution
+        if self._conflict_detector is not None and all_claims:
+            existing_claims = self._ledger.list_claims(limit=10000)
+            conflicts = self._conflict_detector.detect(all_claims, existing_claims)
+            if conflicts and self._conflict_resolver is not None:
+                resolutions = await self._conflict_resolver.resolve_batch(conflicts)
+                stats["conflicts_detected"] = len(conflicts)
+                stats["conflicts_auto_resolved"] = sum(
+                    1 for r in resolutions if r.winner_id is not None
+                )
+                stats["conflicts_manual_pending"] = sum(
+                    1 for r in resolutions if r.winner_id is None
+                )
 
         if self._settings.enable_graph_agent and all_claims:
             await self._run_graph_agent(all_claims)

@@ -8,8 +8,7 @@ from uuid import uuid4
 from noodly.models.claims import Claim, KnowledgeClass
 from noodly.tracking.changelog import ChangeEvent, ChangeLog, ChangeType
 from noodly.tracking.claim_differ import ClaimDiff, ClaimDiffer, ClaimModification
-from noodly.tracking.content_differ import ContentDiff, ContentDiffer, ModifiedSection
-
+from noodly.tracking.content_differ import ContentDiff, ContentDiffer
 
 # --- ContentDiffer ---
 
