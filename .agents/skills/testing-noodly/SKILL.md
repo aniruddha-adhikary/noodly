@@ -1,100 +1,89 @@
 ---
 name: testing-noodly
-description: E2E testing for noodly pipeline (ingest, extract, score, project). Use when verifying pipeline, agent, caching, or CLI changes.
+description: Test noodly's knowledge pipeline end-to-end — ingestion, extraction, projection, GitLab sync, and CI. Use when verifying pipeline changes, projection features, or parser fixes.
 ---
 
-# Testing Noodly E2E
+# Testing Noodly
 
 ## Devin Secrets Needed
-- `NOODLY_OPENAI_API_KEY` — required for claim extraction and agent tests
+- `NOODLY_OPENAI_API_KEY` — OpenAI API key for LLM extraction
+- `NOODLY_GITLAB_TOKEN` — GitLab personal access token with `api` scope
+- `NOODLY_GITLAB_URL` — GitLab base URL (e.g., `https://gitlab.com/aniruddha-adhikary/noodle-test`)
+- `NOODLY_GITLAB_PROJECT_ID` — GitLab project numeric ID (e.g., `82292054`)
 
 ## Environment Setup
 
-1. Start FalkorDB:
+1. Start FalkorDB: `docker compose up -d` (runs on port 6379/Redis + 3000/UI)
+2. Install dev deps: `pip install -e ".[dev]"`
+3. Create test directories:
    ```bash
-   cd /home/ubuntu/repos/noodly && docker compose up -d
+   mkdir -p /home/ubuntu/test-brain /home/ubuntu/test-inbox
    ```
-2. Verify container is running:
-   ```bash
-   docker compose ps  # should show falkordb healthy
-   ```
-3. Clean previous state (if needed):
-   ```bash
-   rm -rf brain/ inbox/ && mkdir -p inbox
-   ```
-4. Initialize brain:
-   ```bash
-   noodly init
-   ```
+4. Place test documents in `/home/ubuntu/test-inbox/` (use real docs from arXiv, customs.gov.sg, etc.)
 
-## Core Pipeline Testing
+## Running Tests
 
-1. **Create test documents** in `inbox/` — use .md, .txt, .csv files with varied content (company policies, meeting notes, data tables)
-2. **Initial ingest**: `noodly ingest` — verify artifacts, claims, and projected file counts are >0
-3. **Stats check**: `noodly stats` — verify claim distribution across knowledge classes (stable, stateful, process)
-4. **Search**: `noodly search "<term>"` — verify semantic search returns relevant results
-5. **Claims**: `noodly claims --limit 20` — verify claims have scores, status, and evidence counts
-
-## Cache Testing
-
-- `noodly cache stats` — shows parse, extraction, and agent decision cache counts
-- `noodly cache clear --level parse` — clears only parse cache
-- `noodly cache clear --level extraction` — clears only extraction cache
-- `noodly cache clear` — clears all caches
-- After re-ingest of a modified file, pipeline should report `N cached` chunks (unchanged sections served from extraction cache)
-
-## Change Tracking Testing
-
-1. **Unchanged re-ingest**: run `noodly ingest` without modifying files — should process 0 files (hash dedup)
-2. **Modified file**: edit a file, run `noodly ingest` — should detect and process only the changed file
-3. **Changelog**: `noodly changelog -n 10` — shows recent events (document_added, document_modified, claim_added)
-4. **Source filter**: `noodly changelog --source <path>` — filters events to a specific source file
-
-## Agent Testing
-
-Agents are OFF by default. Enable via environment variables:
-
-### QA Agent
+### Unit Tests
 ```bash
-NOODLY_ENABLE_QA_AGENT=true noodly ingest
-```
-- Create a document with intentionally malformed tables (column count mismatches, missing headers)
-- QA agent should detect issues and report them with severity ratings
-- Direct test: use `ExtractionQAAgent.review(markdown, content_diff)` to test without full pipeline
-
-### Graph Agent
-```bash
-NOODLY_ENABLE_GRAPH_AGENT=true noodly ingest
-```
-- Ingest documents with overlapping entities across files
-- Graph agent should discover relationships and gaps
-- Check `noodly changelog` for events with `agent="graph_population_agent"`
-
-## File Format Support
-
-Supported: .md, .txt, .csv, .html, .pdf, .docx, .xlsx, .pptx (via MarkItDown)
-Not supported: .exe, .tar.gz, .dll, .bin (correctly rejected by connector)
-
-## Common Issues
-
-- **FalkorDB connection noise**: `Connection closed by server` logs during init are cosmetic — retry is automatic
-- **Graphiti edge warnings**: `Target entity not found in nodes for edge relation` is from Graphiti internals, not noodly code
-- **Slow first ingest**: Initial ingest with OpenAI API calls can take 2-5 minutes for 4+ files (Graphiti episode creation is the bottleneck)
-- **Decision cache at 0**: Normal if test documents don't have entity name aliases — the merge cache only populates when the graph agent identifies alias pairs
-
-## Unit Tests
-
-```bash
-pytest  # runs all 109 tests
-pytest tests/test_parsing.py  # parsing + chunking
-pytest tests/test_tracking.py  # content diff + claim diff + changelog
-pytest tests/test_caching.py  # cache manager + layers
-pytest tests/test_agents.py  # QA + graph agents
+pytest tests/ -x -q  # All tests (270+)
+ruff check src/ tests/  # Lint
 ```
 
-## Lint
-
+### Pipeline E2E
 ```bash
-ruff check src/
-ruff format --check src/
+# Basic ingest
+NOODLY_BRAIN_DIR=/home/ubuntu/test-brain NOODLY_WATCH_DIR=/home/ubuntu/test-inbox noodly ingest
+
+# With GitLab projection auto-sync
+NOODLY_BRAIN_DIR=/home/ubuntu/test-brain NOODLY_WATCH_DIR=/home/ubuntu/test-inbox NOODLY_ENABLE_GITLAB_PROJECTION=true noodly ingest
 ```
+
+### GitLab Projection
+```bash
+# Dry run — see what files would be synced
+noodly gitlab diff
+
+# Full sync — push all claims to GitLab
+noodly gitlab sync -m "commit message"
+
+# Incremental push — only specific subjects
+noodly gitlab push -s "HTTP/2" -m "commit message"
+
+# Idempotency check — re-run sync, expect 0 changes
+noodly gitlab sync -m "should be no-op"
+```
+
+### Verifying GitLab API
+Use the GitLab API to verify files were created:
+```bash
+curl -H "PRIVATE-TOKEN: $NOODLY_GITLAB_TOKEN" \
+  "https://gitlab.com/api/v4/projects/$NOODLY_GITLAB_PROJECT_ID/repository/tree?path=knowledge&recursive=true"
+```
+
+## Key Testing Patterns
+
+### GitLab Projection Tests
+1. **Full sync**: Verify all entity pages + claim files + index.md are created
+2. **Idempotency**: Re-running sync with no changes should produce 0 commits
+3. **Incremental**: Pushing for a specific subject should only process that subject's files
+4. **Content detection**: Changes to volatile frontmatter (`last_updated`, `last_projected`) should NOT trigger updates
+5. **Modification detection**: Adding a new claim for a subject should trigger 1 create + 2 updates (entity page + index)
+
+### Docling OCR
+- Verify source code: `DocumentConverter(**converter_kwargs)` (not bare `DocumentConverter()`)
+- Check imports: `PdfPipelineOptions`, `StandardPdfPipeline` (Docling v2 API)
+- OCR disabled path: no `pipeline_options` in kwargs
+
+### CI Workflow
+- Check `.github/workflows/ci.yml` exists
+- Verify lint job runs `ruff check`
+- Verify test job runs `pytest` on Python 3.11 + 3.12 matrix
+- Use `git_pr_checks` to verify CI passes on PRs
+
+## Gotchas
+- **Ledger JSON format**: `ledger.json` is a flat list of claim dicts. All UUID fields (e.g., `artifact_id`, `id`) must be valid UUIDs — manually editing with non-UUID strings will cause `FactLedger._load()` to fail silently and start fresh.
+- **FalkorDB in CI**: Pipeline tests must mock `Brain` at the module level (`patch("noodly.pipeline.Brain")`) because `Brain.__init__` eagerly connects to Redis via `FalkorDriver`.
+- **GitLab API auth**: Uses `PRIVATE-TOKEN` header (not Bearer). The `GitLabClient` handles this.
+- **Content comparison**: The `_content_changed()` function strips `last_updated` and `last_projected` lines before comparing — this prevents no-op commits from timestamp-only changes.
+- **Env vars**: All use `NOODLY_` prefix. Key feature flags: `NOODLY_ENABLE_GITLAB_PROJECTION`, `NOODLY_ENABLE_SEMANTIC_DEDUP`, `NOODLY_ENABLE_CONFLICT_RESOLUTION`, `NOODLY_ENABLE_EVENT_DISPATCH`.
+- **Real documents preferred**: Use actual PDFs from arXiv, government circulars from customs.gov.sg, etc. rather than synthetic markdown. Ingest PDFs directly to test the full parsing pipeline.
