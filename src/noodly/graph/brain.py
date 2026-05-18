@@ -12,10 +12,7 @@ from graphiti_core.embedder.openai import OpenAIEmbedder, OpenAIEmbedderConfig
 from graphiti_core.llm_client import OpenAIClient
 from graphiti_core.llm_client.config import LLMConfig
 from graphiti_core.nodes import EpisodeType
-from graphiti_core.search.search_config_recipes import (
-    EDGE_HYBRID_SEARCH_RRF,
-    NODE_HYBRID_SEARCH_RRF,
-)
+from graphiti_core.search.search_config import SearchConfig
 
 from noodly.config import Settings
 from noodly.models.artifacts import SourceArtifact
@@ -101,45 +98,48 @@ class Brain:
 
     async def search_nodes(self, query: str, limit: int = 10) -> list[dict]:
         """Semantic + keyword hybrid search over entity nodes."""
-        results = await self._graphiti.search(
+        config = SearchConfig(limit=limit)
+        results = await self._graphiti.search_(
             query=query,
-            config=NODE_HYBRID_SEARCH_RRF,
+            config=config,
             group_ids=[self._settings.group_id],
-            num_results=limit,
         )
         return [
             {
-                "uuid": r.uuid,
-                "name": r.name,
-                "summary": r.summary if hasattr(r, "summary") else "",
-                "group_id": r.group_id,
-                "created_at": str(r.created_at) if hasattr(r, "created_at") else "",
+                "uuid": n.uuid,
+                "name": n.name,
+                "summary": n.summary,
+                "group_id": n.group_id,
+                "created_at": str(n.created_at),
             }
-            for r in results
+            for n in results.nodes
         ]
 
     async def search_facts(self, query: str, limit: int = 10) -> list[dict]:
         """Semantic + keyword hybrid search over relationship edges (facts)."""
-        results = await self._graphiti.search(
+        config = SearchConfig(limit=limit)
+        results = await self._graphiti.search_(
             query=query,
-            config=EDGE_HYBRID_SEARCH_RRF,
+            config=config,
             group_ids=[self._settings.group_id],
-            num_results=limit,
         )
         return [
             {
-                "uuid": r.uuid,
-                "name": r.name if hasattr(r, "name") else r.fact if hasattr(r, "fact") else "",
-                "fact": r.fact if hasattr(r, "fact") else "",
-                "created_at": str(r.created_at) if hasattr(r, "created_at") else "",
-                "expired_at": str(r.expired_at) if hasattr(r, "expired_at") else "",
+                "uuid": e.uuid,
+                "name": e.name,
+                "fact": e.fact,
+                "created_at": str(e.created_at),
+                "expired_at": str(e.expired_at) if e.expired_at else "",
             }
-            for r in results
+            for e in results.edges
         ]
 
     async def get_episodes(self, last_n: int = 20) -> list[dict]:
         """Return the most recent episodes."""
-        results = await self._graphiti.get_episodes(
+        from datetime import datetime, timezone
+
+        results = await self._graphiti.retrieve_episodes(
+            reference_time=datetime.now(timezone.utc),
             group_ids=[self._settings.group_id],
             last_n=last_n,
         )
@@ -149,7 +149,6 @@ class Brain:
                 "name": ep.name,
                 "source_description": ep.source_description,
                 "created_at": str(ep.created_at),
-                "reference_time": str(getattr(ep, "reference_time", "")),
             }
             for ep in results
         ]
