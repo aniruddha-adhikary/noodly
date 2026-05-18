@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import mimetypes
 from datetime import datetime, timezone
@@ -68,9 +69,24 @@ class LocalFSConnector(BaseConnector):
         artifacts = await connector.scan()
     """
 
-    def __init__(self, watch_dir: Path) -> None:
+    def __init__(self, watch_dir: Path, hash_file: Path | None = None) -> None:
         self._watch_dir = watch_dir.resolve()
+        self._hash_path = hash_file or (self._watch_dir / ".hashes.json")
         self._seen_hashes: dict[str, str] = {}
+        self._load_hashes()
+
+    def _load_hashes(self) -> None:
+        """Load persistent hash state from disk."""
+        if self._hash_path.exists():
+            try:
+                self._seen_hashes = json.loads(self._hash_path.read_text())
+            except (json.JSONDecodeError, OSError):
+                logger.warning("Could not load hash file %s", self._hash_path)
+
+    def _save_hashes(self) -> None:
+        """Persist hash state to disk for idempotent re-ingestion."""
+        self._hash_path.parent.mkdir(parents=True, exist_ok=True)
+        self._hash_path.write_text(json.dumps(self._seen_hashes, indent=2, sort_keys=True))
 
     async def scan(self) -> list[SourceArtifact]:
         """Walk the directory and return artifacts for new/changed files."""
@@ -79,8 +95,11 @@ class LocalFSConnector(BaseConnector):
             return []
 
         artifacts: list[SourceArtifact] = []
+        dirty = False
         for path in sorted(self._watch_dir.rglob("*")):
             if not path.is_file():
+                continue
+            if path.name == ".hashes.json":
                 continue
             if path.suffix.lower() not in SUPPORTED_EXTENSIONS:
                 continue
@@ -96,6 +115,7 @@ class LocalFSConnector(BaseConnector):
                 continue
 
             self._seen_hashes[file_key] = content_hash
+            dirty = True
 
             stat = path.stat()
             mtime = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
@@ -115,6 +135,9 @@ class LocalFSConnector(BaseConnector):
                 },
             )
             artifacts.append(artifact)
+
+        if dirty:
+            self._save_hashes()
 
         logger.info("Scanned %s: found %d new/changed files", self._watch_dir, len(artifacts))
         return artifacts

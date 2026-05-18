@@ -10,6 +10,7 @@ from noodly.extraction.extractor import ClaimExtractor
 from noodly.graph.brain import Brain
 from noodly.models.artifacts import SourceArtifact
 from noodly.projection.markdown import MarkdownProjector
+from noodly.scoring.authority import AuthorityRegistry
 from noodly.scoring.ledger import FactLedger
 
 logger = logging.getLogger(__name__)
@@ -34,7 +35,11 @@ class Pipeline:
             api_key=settings.openai_api_key,
             model=settings.openai_model,
         )
-        self._ledger = FactLedger(settings.brain_dir / "ledger.json")
+        self._authority = AuthorityRegistry(settings.brain_dir / "authority.json")
+        self._ledger = FactLedger(
+            settings.brain_dir / "ledger.json",
+            authority_registry=self._authority,
+        )
         self._projector = MarkdownProjector(settings.brain_dir)
 
     async def initialize(self) -> None:
