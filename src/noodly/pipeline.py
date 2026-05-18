@@ -165,7 +165,9 @@ class Pipeline:
                     dedup_result.unique_count,
                 )
                 stats["semantic_merged"] = dedup_result.merged_count
-                # Save merged claims (evidence was added in-place)
+                # Auto-promote merged claims and save
+                for _, existing_claim in dedup_result.merged:
+                    self._ledger._auto_promote(existing_claim)
                 self._ledger._save()
                 # Only store the unique (unmatched) claims
                 all_claims = dedup_result.unique
