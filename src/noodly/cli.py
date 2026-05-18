@@ -251,6 +251,83 @@ def project() -> None:
 
 
 @cli.command()
+@click.option("--branch", "-b", default=None, help="Target branch (default: from config)")
+@click.option("--message", "-m", default=None, help="Commit message")
+@click.option("--dry-run", is_flag=True, help="Show what would be published without pushing")
+def publish(branch: str | None, message: str | None, dry_run: bool) -> None:
+    """Publish projected brain to GitLab."""
+    from noodly.dispatch.gitlab_handler import GitLabClient, GitLabConfig
+
+    settings = get_settings()
+    brain_dir = settings.brain_dir
+
+    if not settings.gitlab_token:
+        console.print("[red]Error: NOODLY_GITLAB_TOKEN not set[/red]")
+        raise SystemExit(1)
+    if not settings.gitlab_project_id:
+        console.print("[red]Error: NOODLY_GITLAB_PROJECT_ID not set[/red]")
+        raise SystemExit(1)
+
+    # Collect all projected files (entities/, topics/, sources/, conflicts/, index.md)
+    files: dict[str, str] = {}
+    for subdir in ["entities", "topics", "sources", "conflicts"]:
+        dir_path = brain_dir / subdir
+        if dir_path.is_dir():
+            for md_file in sorted(dir_path.glob("*.md")):
+                rel_path = f"{subdir}/{md_file.name}"
+                files[rel_path] = md_file.read_text()
+
+    index_path = brain_dir / "index.md"
+    if index_path.exists():
+        files["index.md"] = index_path.read_text()
+
+    if not files:
+        console.print("[yellow]No projected files found. Run 'noodly project' first.[/yellow]")
+        return
+
+    if dry_run:
+        console.print(f"[bold]Would publish {len(files)} files to GitLab:[/bold]")
+        for path in sorted(files.keys()):
+            console.print(f"  {settings.gitlab_knowledge_path}/{path}")
+        return
+
+    config = GitLabConfig(
+        url=settings.gitlab_url,
+        token=settings.gitlab_token,
+        project_id=settings.gitlab_project_id,
+        target_branch=settings.gitlab_target_branch,
+        knowledge_path=settings.gitlab_knowledge_path,
+    )
+    client = GitLabClient(config)
+
+    commit_msg = message or f"noodly: publish {len(files)} knowledge files"
+    target_branch = branch or settings.gitlab_target_branch
+
+    async def _publish():
+        try:
+            result = await client.commit_knowledge_files(
+                target_branch, files, commit_msg
+            )
+            return result
+        finally:
+            await client.close()
+
+    result = _run(_publish())
+
+    if result.get("id") or result.get("short_id"):
+        commit_url = result.get("web_url", "")
+        console.print(
+            f"[green]Published {len(files)} files to GitLab[/green] "
+            f"(commit: {result.get('short_id', 'ok')})"
+        )
+        if commit_url:
+            console.print(f"  {commit_url}")
+    else:
+        error_msg = result.get("message", result.get("error", str(result)))
+        console.print(f"[red]Publish failed: {error_msg}[/red]")
+
+
+@cli.command()
 def serve() -> None:
     """Start the MCP server (for AI agent integration)."""
     from noodly.server.mcp_server import run_server
