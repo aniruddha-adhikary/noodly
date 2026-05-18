@@ -89,17 +89,56 @@ class DocumentParser:
     # Formats supported by MarkItDown
     SUPPORTED_EXTENSIONS = {
         # Documents
-        ".pdf", ".docx", ".doc", ".pptx", ".ppt", ".xlsx", ".xls",
+        ".pdf",
+        ".docx",
+        ".doc",
+        ".pptx",
+        ".ppt",
+        ".xlsx",
+        ".xls",
         # Text
-        ".txt", ".md", ".markdown", ".rst", ".csv", ".tsv", ".json",
-        ".yaml", ".yml", ".xml", ".html", ".htm", ".tex",
+        ".txt",
+        ".md",
+        ".markdown",
+        ".rst",
+        ".csv",
+        ".tsv",
+        ".json",
+        ".yaml",
+        ".yml",
+        ".xml",
+        ".html",
+        ".htm",
+        ".tex",
         # Code
-        ".py", ".js", ".ts", ".go", ".rs", ".java", ".c", ".cpp", ".h", ".sh",
+        ".py",
+        ".js",
+        ".ts",
+        ".go",
+        ".rs",
+        ".java",
+        ".c",
+        ".cpp",
+        ".h",
+        ".sh",
         # Config
-        ".toml", ".ini", ".cfg", ".conf", ".log",
+        ".toml",
+        ".ini",
+        ".cfg",
+        ".conf",
+        ".log",
         # Other MarkItDown formats
-        ".wav", ".mp3", ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff",
-        ".zip", ".msg", ".eml",
+        ".wav",
+        ".mp3",
+        ".jpg",
+        ".jpeg",
+        ".png",
+        ".gif",
+        ".bmp",
+        ".tiff",
+        ".zip",
+        ".msg",
+        ".eml",
     }
 
     def __init__(self, enable_docling: bool = False, ocr_enabled: bool = True) -> None:
@@ -138,9 +177,27 @@ class DocumentParser:
         ext = path.suffix.lower()
 
         # For plain text files, read directly (faster than MarkItDown)
-        if ext in {".txt", ".md", ".markdown", ".rst", ".py", ".js", ".ts",
-                   ".go", ".rs", ".java", ".c", ".cpp", ".h", ".sh",
-                   ".toml", ".ini", ".cfg", ".conf", ".log"}:
+        if ext in {
+            ".txt",
+            ".md",
+            ".markdown",
+            ".rst",
+            ".py",
+            ".js",
+            ".ts",
+            ".go",
+            ".rs",
+            ".java",
+            ".c",
+            ".cpp",
+            ".h",
+            ".sh",
+            ".toml",
+            ".ini",
+            ".cfg",
+            ".conf",
+            ".log",
+        }:
             return self._parse_text(path)
 
         # For binary/complex formats, use MarkItDown
@@ -187,20 +244,22 @@ class DocumentParser:
             if self._docling_converter is None:
                 from docling.document_converter import DocumentConverter
 
-                pipeline_options = {}
+                converter_kwargs: dict = {}
                 if self._ocr_enabled:
                     try:
+                        from docling.datamodel.pipeline_options import PdfPipelineOptions
                         from docling.pipeline.standard_pdf_pipeline import (
-                            StandardPdfPipelineOptions,
+                            StandardPdfPipeline,
                         )
 
-                        pdf_opts = StandardPdfPipelineOptions()
-                        pdf_opts.do_ocr = True
-                        pipeline_options["pdf"] = pdf_opts
+                        pdf_opts = PdfPipelineOptions(do_ocr=True)
+                        converter_kwargs["pipeline_options"] = {
+                            StandardPdfPipeline: pdf_opts,
+                        }
                     except ImportError:
                         pass
 
-                self._docling_converter = DocumentConverter()
+                self._docling_converter = DocumentConverter(**converter_kwargs)
 
             result = self._docling_converter.convert(str(path))
             markdown = result.document.export_to_markdown()
@@ -230,9 +289,7 @@ class DocumentParser:
                 metadata={"parser_backend": "docling"},
             )
         except ImportError:
-            logger.warning(
-                "Docling not installed. Install with: pip install noodly[docling]"
-            )
+            logger.warning("Docling not installed. Install with: pip install noodly[docling]")
             return self._parse_with_markitdown(path)
         except Exception:
             logger.exception("Docling failed for %s, falling back to MarkItDown", path)

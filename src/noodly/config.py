@@ -66,6 +66,7 @@ class Settings(BaseSettings):
     gitlab_target_branch: str = "main"
     gitlab_knowledge_path: str = "knowledge"
     enable_gitlab_handler: bool = False
+    enable_gitlab_projection: bool = False
 
 
 def get_settings() -> Settings:
