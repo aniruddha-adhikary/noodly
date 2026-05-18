@@ -56,9 +56,25 @@ class Pipeline:
             request_timeout=settings.llm_request_timeout,
         )
         self._authority = AuthorityRegistry(settings.brain_dir / "authority.json")
+
+        # Phase 8: embedding provider for ingestion-time semantic dedup
+        embedding_provider = None
+        if settings.enable_ingestion_embeddings and settings.openai_api_key:
+            from noodly.scoring.ledger import EmbeddingProvider
+
+            embedding_provider = EmbeddingProvider(
+                api_key=settings.openai_api_key,
+                model=settings.embedding_model,
+            )
+
         self._ledger = FactLedger(
             settings.brain_dir / "ledger.json",
             authority_registry=self._authority,
+            embedding_provider=embedding_provider,
+            promote_threshold=settings.promote_threshold,
+            high_authority_threshold=settings.high_authority_threshold,
+            corroboration_count=settings.corroboration_count,
+            semantic_dedup_threshold=settings.semantic_dedup_threshold,
         )
         self._projector = MarkdownProjector(settings.brain_dir)
 
@@ -185,26 +201,13 @@ class Pipeline:
             all_claims.extend(claims)
             stats["cached_chunks"] += cached
 
-        # Phase 4/5: semantic dedup before storing — actually merge evidence
-        if self._semantic_dedup is not None and all_claims:
-            existing = self._ledger.list_claims(limit=10000)
-            dedup_result = await self._semantic_dedup.deduplicate_and_merge(all_claims, existing)
-            if dedup_result.merged_count > 0:
-                logger.info(
-                    "Semantic dedup: merged %d claims, %d unique",
-                    dedup_result.merged_count,
-                    dedup_result.unique_count,
-                )
-                stats["semantic_merged"] = dedup_result.merged_count
-                # Auto-promote merged claims and save
-                for _, existing_claim in dedup_result.merged:
-                    self._ledger._auto_promote(existing_claim)
-                self._ledger._save()
-                # Only store the unique (unmatched) claims
-                all_claims = dedup_result.unique
-
-        stored = self._ledger.add_claims(all_claims)
+        # Phase 8: ingestion-time semantic dedup via add_claims_async
+        # Embeds claims in batch, then each claim is deduped against stored
+        # embeddings inside add_claim() — no separate post-hoc pass needed.
+        stored = await self._ledger.add_claims_async(all_claims)
         stats["claims"] = len(stored)
+        stats["embedded"] = self._ledger.embedded_count()
+        stats.update(self._ledger.promotion_stats())
 
         self._ledger.apply_decay()
 

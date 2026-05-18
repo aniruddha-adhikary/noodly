@@ -816,3 +816,133 @@ def cache_clear(level: str) -> None:
         mgr = CacheManager(cache_dir)
         removed = mgr.extraction.invalidate_all()
         console.print(f"[green]Extraction cache cleared ({removed} entries).[/green]")
+
+
+# ── Phase 8: Promotion & Embedding commands ──────────────────────────
+
+
+@cli.command()
+def promote() -> None:
+    """Auto-promote all eligible claims based on evidence, authority, and score."""
+    from noodly.scoring.authority import AuthorityRegistry
+    from noodly.scoring.ledger import FactLedger
+
+    settings = get_settings()
+    authority = AuthorityRegistry(settings.brain_dir / "authority.json")
+    ledger = FactLedger(
+        settings.brain_dir / "ledger.json",
+        authority_registry=authority,
+        promote_threshold=settings.promote_threshold,
+        high_authority_threshold=settings.high_authority_threshold,
+        corroboration_count=settings.corroboration_count,
+    )
+
+    promoted = ledger.auto_promote_all()
+    pstats = ledger.promotion_stats()
+
+    console.print(f"[green]Promoted {promoted} claims.[/green]")
+    table = Table(title="Claim Status Distribution")
+    table.add_column("Status", style="cyan")
+    table.add_column("Count", justify="right")
+    for status_name, count in sorted(pstats.items()):
+        table.add_row(status_name, str(count))
+    console.print(table)
+
+
+@cli.command(name="promote-claim")
+@click.argument("claim_id")
+@click.argument("status", type=click.Choice([
+    "candidate", "unverified", "corroborated",
+    "owner_confirmed", "canonical", "superseded", "rejected",
+]))
+def promote_claim_cmd(claim_id: str, status: str) -> None:
+    """Manually promote or demote a single claim's status."""
+    from noodly.models.claims import ClaimStatus
+    from noodly.scoring.ledger import FactLedger
+
+    settings = get_settings()
+    ledger = FactLedger(settings.brain_dir / "ledger.json")
+
+    new_status = ClaimStatus(status)
+    result = ledger.promote_claim(claim_id, new_status)
+
+    if result is None:
+        console.print(f"[red]Claim {claim_id} not found.[/red]")
+        raise SystemExit(1)
+
+    console.print(
+        f"[green]Claim {claim_id[:8]}… → {result.status.value}[/green] "
+        f"(score={result.truth_score:.2f})"
+    )
+
+
+@cli.command(name="embedding-stats")
+def embedding_stats() -> None:
+    """Show embedding coverage statistics for stored claims."""
+    from noodly.scoring.ledger import FactLedger
+
+    settings = get_settings()
+    ledger = FactLedger(settings.brain_dir / "ledger.json")
+
+    total = ledger.count
+    embedded = ledger.embedded_count()
+    pct = (embedded / total * 100) if total > 0 else 0.0
+
+    console.print("\n[bold]Embedding Statistics[/bold]")
+    console.print(f"  Total claims:    {total}")
+    console.print(f"  With embeddings: {embedded}")
+    console.print(f"  Coverage:        {pct:.1f}%")
+    console.print(f"  Model:           {settings.embedding_model}")
+    console.print(f"  Dimensions:      {settings.embedding_dim}")
+
+    if embedded < total:
+        missing = total - embedded
+        console.print(
+            f"\n[yellow]{missing} claims lack embeddings. "
+            f"Run 'noodly embed-claims' to backfill.[/yellow]"
+        )
+
+
+@cli.command(name="embed-claims")
+@click.option("--batch-size", default=100, help="Claims per API batch")
+def embed_claims(batch_size: int) -> None:
+    """Backfill embeddings for claims that don't have them yet."""
+    from noodly.scoring.ledger import EmbeddingProvider, FactLedger, _claim_text
+
+    settings = get_settings()
+
+    if not settings.openai_api_key:
+        console.print("[red]Error: NOODLY_OPENAI_API_KEY not set[/red]")
+        raise SystemExit(1)
+
+    ledger = FactLedger(settings.brain_dir / "ledger.json")
+    provider = EmbeddingProvider(
+        api_key=settings.openai_api_key,
+        model=settings.embedding_model,
+    )
+
+    all_claims = ledger.list_claims(limit=100000)
+    missing = [c for c in all_claims if not c.embedding]
+
+    if not missing:
+        console.print("[green]All claims already have embeddings.[/green]")
+        return
+
+    console.print(f"Backfilling embeddings for {len(missing)} claims...")
+
+    async def _embed():
+        for i in range(0, len(missing), batch_size):
+            batch = missing[i : i + batch_size]
+            texts = [_claim_text(c) for c in batch]
+            embeddings = await provider.embed_batch(texts)
+            for claim, emb in zip(batch, embeddings):
+                claim.embedding = emb
+            console.print(f"  Embedded {min(i + batch_size, len(missing))}/{len(missing)}")
+
+    _run(_embed())
+    ledger._save()
+
+    console.print(
+        f"[green]Backfilled embeddings for {len(missing)} claims "
+        f"(model={settings.embedding_model}).[/green]"
+    )

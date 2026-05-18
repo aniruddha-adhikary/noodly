@@ -258,4 +258,5 @@ def test_auto_promote(tmp_path):
         ],
     )
     result = ledger.add_claim(claim)
-    assert result.status == ClaimStatus.unverified
+    # 2 independent supporting sources → corroborated (Phase 8 promotion)
+    assert result.status == ClaimStatus.corroborated

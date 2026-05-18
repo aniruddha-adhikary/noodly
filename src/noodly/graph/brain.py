@@ -52,7 +52,11 @@ class Brain:
             model=settings.openai_model,
         )
         llm_client = OpenAIClient(config=llm_config)
-        embedder_config = OpenAIEmbedderConfig(api_key=settings.openai_api_key)
+        embedder_config = OpenAIEmbedderConfig(
+            api_key=settings.openai_api_key,
+            embedding_model=settings.embedding_model,
+            embedding_dim=settings.embedding_dim,
+        )
         embedder = OpenAIEmbedder(config=embedder_config)
         cross_encoder = OpenAIRerankerClient(config=llm_config)
         self._graphiti = Graphiti(
