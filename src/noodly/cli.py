@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import click
@@ -146,13 +147,16 @@ def search(query: str, limit: int) -> None:
 @cli.command()
 @click.option("--status", "-s", default="", help="Filter by claim status")
 @click.option("--limit", "-n", default=20, help="Maximum results")
-def claims(status: str, limit: int) -> None:
+@click.option("--as-of", default="", help="Bi-temporal: valid-time filter (ISO date)")
+def claims(status: str, limit: int, as_of: str) -> None:
     """List claims from the fact ledger."""
     from noodly.models.claims import ClaimStatus
+    from noodly.scoring.authority import AuthorityRegistry
     from noodly.scoring.ledger import FactLedger
 
     settings = get_settings()
-    ledger = FactLedger(settings.brain_dir / "ledger.json")
+    authority = AuthorityRegistry(settings.brain_dir / "authority.json")
+    ledger = FactLedger(settings.brain_dir / "ledger.json", authority_registry=authority)
 
     claim_status = None
     if status:
@@ -162,7 +166,17 @@ def claims(status: str, limit: int) -> None:
             console.print(f"[red]Unknown status: {status}[/red]")
             return
 
-    results = ledger.list_claims(status=claim_status, limit=limit)
+    as_of_valid = None
+    if as_of:
+        try:
+            as_of_valid = datetime.fromisoformat(as_of)
+            if as_of_valid.tzinfo is None:
+                as_of_valid = as_of_valid.replace(tzinfo=timezone.utc)
+        except ValueError:
+            console.print(f"[red]Invalid date format: {as_of}[/red]")
+            return
+
+    results = ledger.list_claims(status=claim_status, limit=limit, as_of_valid=as_of_valid)
 
     if not results:
         console.print("[yellow]No claims found.[/yellow]")
@@ -243,3 +257,58 @@ def serve() -> None:
 
     console.print("[bold]Starting Noodly MCP server...[/bold]")
     run_server()
+
+
+@cli.group()
+def authority() -> None:
+    """Manage source authority weights."""
+
+
+@authority.command(name="list")
+def authority_list() -> None:
+    """List all registered source authority weights."""
+    from noodly.scoring.authority import AuthorityRegistry
+
+    settings = get_settings()
+    registry = AuthorityRegistry(settings.brain_dir / "authority.json")
+    sources = registry.list_sources()
+
+    if not sources:
+        console.print("[yellow]No source authorities configured. Default weight is 0.5.[/yellow]")
+        return
+
+    table = Table(title="Source Authority Weights")
+    table.add_column("Source", style="cyan")
+    table.add_column("Weight", justify="right")
+
+    for source, weight in sources.items():
+        table.add_row(source, f"{weight:.2f}")
+
+    console.print(table)
+
+
+@authority.command(name="set")
+@click.argument("source")
+@click.argument("weight", type=float)
+def authority_set(source: str, weight: float) -> None:
+    """Set authority weight for a source (0.0-1.0)."""
+    from noodly.scoring.authority import AuthorityRegistry
+
+    settings = get_settings()
+    registry = AuthorityRegistry(settings.brain_dir / "authority.json")
+    registry.set(source, weight)
+    console.print(f"[green]Set {source} = {registry.get(source):.2f}[/green]")
+
+
+@authority.command(name="remove")
+@click.argument("source")
+def authority_remove(source: str) -> None:
+    """Remove a source from the authority registry."""
+    from noodly.scoring.authority import AuthorityRegistry
+
+    settings = get_settings()
+    registry = AuthorityRegistry(settings.brain_dir / "authority.json")
+    if registry.remove(source):
+        console.print(f"[green]Removed {source}[/green]")
+    else:
+        console.print(f"[yellow]{source} not found in registry[/yellow]")
