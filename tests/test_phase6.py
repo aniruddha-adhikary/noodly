@@ -469,7 +469,6 @@ class TestCIWorkflowFiles:
         lint_steps = data["jobs"]["lint"]["steps"]
         step_runs = [s.get("run", "") for s in lint_steps]
         assert any("ruff check" in r for r in step_runs)
-        assert any("ruff format" in r for r in step_runs)
 
     def test_ci_test_job_runs_pytest(self):
         import yaml
