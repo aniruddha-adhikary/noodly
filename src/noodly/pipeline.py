@@ -152,17 +152,23 @@ class Pipeline:
             all_claims.extend(claims)
             stats["cached_chunks"] += cached
 
-        # Phase 4: semantic dedup before storing
+        # Phase 4/5: semantic dedup before storing — actually merge evidence
         if self._semantic_dedup is not None and all_claims:
             existing = self._ledger.list_claims(limit=10000)
-            dedup_matches = await self._semantic_dedup.find_duplicates_batch(
+            dedup_result = await self._semantic_dedup.deduplicate_and_merge(
                 all_claims, existing
             )
-            if dedup_matches:
+            if dedup_result.merged_count > 0:
                 logger.info(
-                    "Semantic dedup: %d claims matched existing entries",
-                    len(dedup_matches),
+                    "Semantic dedup: merged %d claims, %d unique",
+                    dedup_result.merged_count,
+                    dedup_result.unique_count,
                 )
+                stats["semantic_merged"] = dedup_result.merged_count
+                # Save merged claims (evidence was added in-place)
+                self._ledger._save()
+                # Only store the unique (unmatched) claims
+                all_claims = dedup_result.unique
 
         stored = self._ledger.add_claims(all_claims)
         stats["claims"] = len(stored)
@@ -283,7 +289,15 @@ class Pipeline:
                     metadata=artifact.metadata,
                     id=artifact.id,
                 )
-                claims = await self._extractor.extract(chunk_artifact)
+                # Pass source filename for provenance tracking
+                source_file = (
+                    Path(artifact.source_uri).name
+                    if artifact.source_uri
+                    else artifact.title
+                )
+                claims = await self._extractor.extract(
+                    chunk_artifact, source_filename=source_file
+                )
                 all_claims.extend(claims)
 
                 self._cache.extraction.put(
@@ -297,6 +311,9 @@ class Pipeline:
                             "knowledge_class": c.knowledge_class.value,
                             "confidence": c.confidence,
                             "source_span": c.evidence[0].source_span if c.evidence else "",
+                            "source_artifact": (
+                                c.evidence[0].source_artifact if c.evidence else ""
+                            ),
                         }
                         for c in claims
                     ],
@@ -341,6 +358,7 @@ class Pipeline:
                         artifact_id=artifact.id,
                         supports=True,
                         source_span=data.get("source_span", ""),
+                        source_artifact=data.get("source_artifact", ""),
                         author=artifact.author,
                     )
                 ],

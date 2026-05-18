@@ -23,6 +23,9 @@ DECAY_RATES: dict[KnowledgeClass, float] = {
 # Minimum truth_score for auto-promotion to "unverified"
 AUTO_PROMOTE_THRESHOLD = 0.3
 
+# Evidence count thresholds for auto-promotion
+CORROBORATION_EVIDENCE_COUNT = 2  # promote to corroborated with 2+ independent sources
+
 
 def _claim_fingerprint(claim: Claim) -> str:
     """Normalize subject+predicate+object into a dedup key."""
@@ -104,6 +107,8 @@ class FactLedger:
             existing.confidence = max(existing.confidence, claim.confidence)
             if claim.last_confirmed_at:
                 existing.last_confirmed_at = claim.last_confirmed_at
+            # Auto-promote based on corroboration
+            self._auto_promote(existing)
             logger.info(
                 "Ledger: merged evidence into existing claim %s [%s] score=%.2f",
                 existing.id,
@@ -256,6 +261,55 @@ class FactLedger:
         if decayed > 0:
             self._save()
         return decayed
+
+    def _auto_promote(self, claim: Claim) -> None:
+        """Auto-promote claim status based on evidence count and score.
+
+        Promotion ladder:
+        - candidate → unverified: truth_score >= AUTO_PROMOTE_THRESHOLD
+        - candidate/unverified → corroborated: 2+ independent supporting sources
+        """
+        independent_sources = len(
+            {str(ev.artifact_id) for ev in claim.evidence if ev.supports}
+        )
+
+        # Corroboration check first — 2+ independent sources is strong signal
+        if (
+            claim.status in (ClaimStatus.candidate, ClaimStatus.unverified)
+            and independent_sources >= CORROBORATION_EVIDENCE_COUNT
+        ):
+            claim.status = ClaimStatus.corroborated
+            claim.last_confirmed_at = datetime.now(timezone.utc)
+            logger.info(
+                "Auto-promoted %s to corroborated (%d sources)",
+                claim.id,
+                independent_sources,
+            )
+            return
+
+        # Score-based promotion for single-source claims
+        if (
+            claim.status == ClaimStatus.candidate
+            and claim.truth_score >= AUTO_PROMOTE_THRESHOLD
+        ):
+            claim.status = ClaimStatus.unverified
+            logger.info(
+                "Auto-promoted %s to unverified (score=%.2f)",
+                claim.id,
+                claim.truth_score,
+            )
+
+    def auto_promote_all(self) -> int:
+        """Run auto-promotion on all claims. Returns count of promoted claims."""
+        promoted = 0
+        for claim in self._claims.values():
+            old_status = claim.status
+            self._auto_promote(claim)
+            if claim.status != old_status:
+                promoted += 1
+        if promoted > 0:
+            self._save()
+        return promoted
 
     @property
     def count(self) -> int:

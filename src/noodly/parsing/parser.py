@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -24,6 +25,53 @@ class ParsedDocument:
     def __post_init__(self) -> None:
         if self.word_count == 0 and self.markdown:
             self.word_count = len(self.markdown.split())
+
+    @property
+    def quality_score(self) -> float:
+        """Heuristic quality score (0.0–1.0) for comparing parser outputs.
+
+        Factors: word count, table presence, non-ASCII ratio (OCR noise),
+        average line length, and structural markers (headings, lists).
+        """
+        if not self.markdown:
+            return 0.0
+
+        score = 0.0
+        text = self.markdown
+
+        # Word count contribution (more content = better, up to a point)
+        wc = self.word_count or len(text.split())
+        score += min(wc / 500, 0.3)  # max 0.3 from word count
+
+        # Table presence
+        if self.tables_detected > 0:
+            score += 0.15
+
+        # Structural markers (headings, lists)
+        headings = len(re.findall(r"^#{1,6}\s", text, re.MULTILINE))
+        lists = len(re.findall(r"^[-*]\s", text, re.MULTILINE))
+        score += min((headings + lists) / 20, 0.2)
+
+        # Penalize OCR noise (high non-ASCII ratio)
+        if wc > 0:
+            non_ascii = sum(1 for c in text if ord(c) > 127)
+            noise_ratio = non_ascii / len(text) if text else 0
+            if noise_ratio > 0.1:
+                score *= 0.7
+
+        # Penalize very short average line length (garbled output)
+        lines = [ln for ln in text.splitlines() if ln.strip()]
+        if lines:
+            avg_len = sum(len(ln) for ln in lines) / len(lines)
+            if avg_len < 10:
+                score *= 0.5
+
+        # Penalize binary-looking content
+        binary_chars = sum(1 for c in text[:500] if ord(c) < 32 and c not in "\n\r\t")
+        if binary_chars > 10:
+            score *= 0.1
+
+        return min(score, 1.0)
 
 
 class DocumentParser:
@@ -54,10 +102,11 @@ class DocumentParser:
         ".zip", ".msg", ".eml",
     }
 
-    def __init__(self, enable_docling: bool = False) -> None:
+    def __init__(self, enable_docling: bool = False, ocr_enabled: bool = True) -> None:
         self._markitdown = None
         self._docling_converter = None
         self._enable_docling = enable_docling
+        self._ocr_enabled = ocr_enabled
 
     def _get_markitdown(self):
         """Lazy-init MarkItDown to avoid import cost until needed."""
@@ -138,6 +187,19 @@ class DocumentParser:
             if self._docling_converter is None:
                 from docling.document_converter import DocumentConverter
 
+                pipeline_options = {}
+                if self._ocr_enabled:
+                    try:
+                        from docling.pipeline.standard_pdf_pipeline import (
+                            StandardPdfPipelineOptions,
+                        )
+
+                        pdf_opts = StandardPdfPipelineOptions()
+                        pdf_opts.do_ocr = True
+                        pipeline_options["pdf"] = pdf_opts
+                    except ImportError:
+                        pass
+
                 self._docling_converter = DocumentConverter()
 
             result = self._docling_converter.convert(str(path))
@@ -145,12 +207,26 @@ class DocumentParser:
 
             tables = markdown.count("| --- ") + markdown.count("|---")
 
+            # Extract table count from Docling's structured output if available
+            doc_tables = 0
+            try:
+                doc_tables = len(list(result.document.tables))
+            except (AttributeError, TypeError):
+                doc_tables = tables
+
+            page_count = 0
+            try:
+                page_count = len(list(result.document.pages))
+            except (AttributeError, TypeError):
+                pass
+
             return ParsedDocument(
                 title=path.name,
                 markdown=markdown,
                 source_format=path.suffix.lstrip("."),
                 word_count=len(markdown.split()),
-                tables_detected=tables,
+                page_count=page_count,
+                tables_detected=doc_tables or tables,
                 metadata={"parser_backend": "docling"},
             )
         except ImportError:
@@ -161,3 +237,37 @@ class DocumentParser:
         except Exception:
             logger.exception("Docling failed for %s, falling back to MarkItDown", path)
             return self._parse_with_markitdown(path)
+
+    def parse_best(self, path: Path) -> ParsedDocument:
+        """Parse with both backends and return the higher-quality result.
+
+        Useful for complex documents where it's unclear which parser will
+        produce better output. Compares quality scores and returns the winner.
+        """
+        markitdown_result = self._parse_with_markitdown(path)
+
+        if not self._enable_docling:
+            return markitdown_result
+
+        docling_result = self._parse_with_docling(path)
+
+        mid_score = markitdown_result.quality_score
+        doc_score = docling_result.quality_score
+
+        logger.info(
+            "Parser comparison for %s: MarkItDown=%.2f, Docling=%.2f",
+            path.name,
+            mid_score,
+            doc_score,
+        )
+
+        if doc_score > mid_score:
+            docling_result.metadata["parser_comparison"] = (
+                f"docling={doc_score:.2f} > markitdown={mid_score:.2f}"
+            )
+            return docling_result
+
+        markitdown_result.metadata["parser_comparison"] = (
+            f"markitdown={mid_score:.2f} >= docling={doc_score:.2f}"
+        )
+        return markitdown_result

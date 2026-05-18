@@ -37,6 +37,7 @@ class ClaimEvidence(BaseModel):
     episode_id: str = ""
     supports: bool = True
     source_span: str = ""
+    source_artifact: str = ""
     author: str = ""
     author_role: str = ""
     source_authority: float = 0.5

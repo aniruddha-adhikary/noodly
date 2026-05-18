@@ -26,7 +26,7 @@ def _fake_settings(tmp_path):
     )
 
 
-def _mock_claims(artifact):
+def _mock_claims(artifact, source_filename=""):
     """Return fake claims as if the LLM extracted them."""
     return [
         Claim(
