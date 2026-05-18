@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -50,12 +50,13 @@ def _mock_claims(artifact, source_filename=""):
 @pytest.mark.asyncio
 async def test_pipeline_run_with_mock(tmp_path):
     settings = _fake_settings(tmp_path)
-    pipeline = Pipeline(settings)
+    with patch("noodly.pipeline.Brain") as MockBrain:
+        mock_brain = MockBrain.return_value
+        mock_brain.initialize = AsyncMock()
+        mock_brain.ingest_artifact = AsyncMock()
+        mock_brain.close = AsyncMock()
+        pipeline = Pipeline(settings)
 
-    # Mock the brain and extractor to avoid needing FalkorDB/OpenAI
-    pipeline._brain.initialize = AsyncMock()
-    pipeline._brain.ingest_artifact = AsyncMock()
-    pipeline._brain.close = AsyncMock()
     pipeline._extractor.extract = AsyncMock(side_effect=_mock_claims)
 
     await pipeline.initialize()
@@ -76,11 +77,13 @@ async def test_pipeline_run_with_mock(tmp_path):
 @pytest.mark.asyncio
 async def test_pipeline_dedup_on_reingest(tmp_path):
     settings = _fake_settings(tmp_path)
-    pipeline = Pipeline(settings)
+    with patch("noodly.pipeline.Brain") as MockBrain:
+        mock_brain = MockBrain.return_value
+        mock_brain.initialize = AsyncMock()
+        mock_brain.ingest_artifact = AsyncMock()
+        mock_brain.close = AsyncMock()
+        pipeline = Pipeline(settings)
 
-    pipeline._brain.initialize = AsyncMock()
-    pipeline._brain.ingest_artifact = AsyncMock()
-    pipeline._brain.close = AsyncMock()
     pipeline._extractor.extract = AsyncMock(side_effect=_mock_claims)
 
     await pipeline.initialize()
@@ -105,7 +108,8 @@ async def test_pipeline_dedup_on_reingest(tmp_path):
 @pytest.mark.asyncio
 async def test_pipeline_authority_wiring(tmp_path):
     settings = _fake_settings(tmp_path)
-    pipeline = Pipeline(settings)
+    with patch("noodly.pipeline.Brain"):
+        pipeline = Pipeline(settings)
 
     # Authority should be wired
     assert pipeline._authority is not None
@@ -115,11 +119,13 @@ async def test_pipeline_authority_wiring(tmp_path):
 @pytest.mark.asyncio
 async def test_pipeline_hash_persistence(tmp_path):
     settings = _fake_settings(tmp_path)
-    pipeline = Pipeline(settings)
+    with patch("noodly.pipeline.Brain") as MockBrain:
+        mock_brain = MockBrain.return_value
+        mock_brain.initialize = AsyncMock()
+        mock_brain.ingest_artifact = AsyncMock()
+        mock_brain.close = AsyncMock()
+        pipeline = Pipeline(settings)
 
-    pipeline._brain.initialize = AsyncMock()
-    pipeline._brain.ingest_artifact = AsyncMock()
-    pipeline._brain.close = AsyncMock()
     pipeline._extractor.extract = AsyncMock(return_value=[])
 
     await pipeline.initialize()
