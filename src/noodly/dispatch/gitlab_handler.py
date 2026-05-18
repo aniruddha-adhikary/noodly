@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from urllib.parse import urlparse
 
 from noodly.dispatch.dispatcher import EventHandler, HandlerResult
 from noodly.resolution.detector import ConflictPair
@@ -30,8 +31,14 @@ class GitLabConfig:
 
     @property
     def api_url(self) -> str:
-        """API base URL (handles trailing slash)."""
-        base = self.url.rstrip("/")
+        """API base URL.
+
+        Handles both instance URLs (``https://gitlab.com``) and full
+        project URLs (``https://gitlab.com/org/repo``) by extracting
+        the scheme + host automatically.
+        """
+        parsed = urlparse(self.url.rstrip("/"))
+        base = f"{parsed.scheme}://{parsed.netloc}"
         return f"{base}/api/v4"
 
 

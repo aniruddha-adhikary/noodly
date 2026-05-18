@@ -673,7 +673,10 @@ class TestExtractionPrompts:
 # ===========================================================================
 
 class TestPhase4Config:
-    def test_default_settings(self):
+    def test_default_settings(self, monkeypatch):
+        monkeypatch.delenv("NOODLY_GITLAB_URL", raising=False)
+        monkeypatch.delenv("NOODLY_GITLAB_TOKEN", raising=False)
+        monkeypatch.delenv("NOODLY_GITLAB_PROJECT_ID", raising=False)
         from noodly.config import Settings
 
         s = Settings(openai_api_key="test")
@@ -728,6 +731,12 @@ class TestGitLabConfig:
             project_id="100",
         )
         assert "git.internal.corp.com" in config.api_url
+
+    def test_full_project_url_extracts_base(self):
+        from noodly.dispatch.gitlab_handler import GitLabConfig
+
+        config = GitLabConfig(url="https://gitlab.com/org/repo")
+        assert config.api_url == "https://gitlab.com/api/v4"
 
 
 class TestGitLabMRHandler:
