@@ -506,7 +506,8 @@ def dispatch_stats() -> None:
     console.print("\n[bold]Event Dispatch Stats[/bold]")
 
     if audit_path.exists():
-        line_count = sum(1 for _ in open(audit_path))
+        with open(audit_path) as f:
+            line_count = sum(1 for _ in f)
         console.print(f"  Audit log entries: {line_count}")
     else:
         console.print("  Audit log: not started")
