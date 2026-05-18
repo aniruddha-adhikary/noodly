@@ -53,7 +53,7 @@ pip install -e ".[dev]"
 
 # Configure
 cp .env.example .env
-# Edit .env and add your OPENAI_API_KEY
+# Edit .env and add your NOODLY_OPENAI_API_KEY
 ```
 
 ### Usage

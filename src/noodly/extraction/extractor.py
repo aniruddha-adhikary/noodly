@@ -57,7 +57,7 @@ EXTRACTION_SCHEMA = {
                         "type": "string",
                         "enum": ["stable", "process", "tacit", "stateful"],
                     },
-                    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                    "confidence": {"type": "number"},
                     "source_span": {"type": "string"},
                 },
                 "required": [
@@ -69,10 +69,12 @@ EXTRACTION_SCHEMA = {
                     "confidence",
                     "source_span",
                 ],
+                "additionalProperties": False,
             },
         }
     },
     "required": ["claims"],
+    "additionalProperties": False,
 }
 
 
