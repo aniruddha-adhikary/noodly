@@ -191,6 +191,40 @@ class GitLabClient:
         async with session.post(url, json={"body": body}) as resp:
             return await resp.json()
 
+    async def list_tree(
+        self,
+        ref: str = "main",
+        path: str = "",
+        recursive: bool = True,
+    ) -> list[dict]:
+        """List repository tree to discover existing files."""
+        session = await self._get_session()
+        url = (
+            f"{self._config.api_url}/projects/{self._config.project_id}"
+            f"/repository/tree"
+        )
+        params: dict[str, str | int] = {
+            "ref": ref,
+            "recursive": "true" if recursive else "false",
+            "per_page": 100,
+        }
+        if path:
+            params["path"] = path
+
+        all_items: list[dict] = []
+        page = 1
+        while True:
+            params["page"] = page
+            async with session.get(url, params=params) as resp:
+                if resp.status >= 400:
+                    break
+                items = await resp.json()
+                if not items:
+                    break
+                all_items.extend(items)
+                page += 1
+        return all_items
+
     async def commit_knowledge_files(
         self,
         branch: str,
@@ -199,11 +233,19 @@ class GitLabClient:
     ) -> dict:
         """Commit multiple knowledge files in a single commit.
 
+        Automatically detects whether each file needs a create or update
+        action by querying the repository tree first.
+
         Args:
             branch: Target branch name.
             files: {file_path: content} mapping.
             commit_message: Commit message.
         """
+        existing = await self.list_tree(
+            ref=branch, path=self._config.knowledge_path
+        )
+        existing_paths = {item["path"] for item in existing}
+
         session = await self._get_session()
         url = (
             f"{self._config.api_url}/projects/{self._config.project_id}"
@@ -212,24 +254,35 @@ class GitLabClient:
         actions = []
         for path, content in files.items():
             full_path = f"{self._config.knowledge_path}/{path}"
+            action = "update" if full_path in existing_paths else "create"
             actions.append(
                 {
-                    "action": "create",
+                    "action": action,
                     "file_path": full_path,
                     "content": content,
                 }
             )
 
-        payload = {
-            "branch": branch,
-            "commit_message": commit_message,
-            "actions": actions,
-        }
-        async with session.post(url, json=payload) as resp:
-            data = await resp.json()
-            if resp.status >= 400:
-                logger.error("GitLab commit failed: %s", data)
-            return data
+        # GitLab commits API has a limit; batch in chunks of 500
+        results = []
+        for i in range(0, len(actions), 500):
+            batch = actions[i : i + 500]
+            batch_msg = commit_message
+            if len(actions) > 500:
+                batch_num = (i // 500) + 1
+                batch_msg = f"{commit_message} (batch {batch_num})"
+            payload = {
+                "branch": branch,
+                "commit_message": batch_msg,
+                "actions": batch,
+            }
+            async with session.post(url, json=payload) as resp:
+                data = await resp.json()
+                if resp.status >= 400:
+                    logger.error("GitLab commit failed: %s", data)
+                results.append(data)
+
+        return results[-1] if results else {}
 
     async def push_knowledge(
         self,
