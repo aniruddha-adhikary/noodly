@@ -7,6 +7,8 @@ import logging
 
 from graphiti_core import Graphiti
 from graphiti_core.driver.falkordb_driver import FalkorDriver
+from graphiti_core.llm_client import OpenAIClient
+from graphiti_core.llm_client.config import LLMConfig
 from graphiti_core.nodes import EpisodeType
 from graphiti_core.search.search_config_recipes import (
     EDGE_HYBRID_SEARCH_RRF,
@@ -40,7 +42,12 @@ class Brain:
             password=settings.falkordb_password,
             database=settings.falkordb_database,
         )
-        self._graphiti = Graphiti(graph_driver=driver)
+        llm_config = LLMConfig(
+            api_key=settings.openai_api_key,
+            model=settings.openai_model,
+        )
+        llm_client = OpenAIClient(config=llm_config)
+        self._graphiti = Graphiti(graph_driver=driver, llm_client=llm_client)
 
     async def initialize(self) -> None:
         """Set up graph indices. Call once on first run."""
