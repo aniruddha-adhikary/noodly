@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 mcp = FastMCP(
     "noodly",
-    description="Company Brain — query organizational knowledge, facts, and context",
+    instructions="Company Brain — query organizational knowledge, facts, and context",
 )
 
 _brain: Brain | None = None

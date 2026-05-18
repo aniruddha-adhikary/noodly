@@ -12,7 +12,13 @@ from graphiti_core.embedder.openai import OpenAIEmbedder, OpenAIEmbedderConfig
 from graphiti_core.llm_client import OpenAIClient
 from graphiti_core.llm_client.config import LLMConfig
 from graphiti_core.nodes import EpisodeType
-from graphiti_core.search.search_config import SearchConfig
+from graphiti_core.search.search_config import (
+    EdgeSearchConfig,
+    EdgeSearchMethod,
+    NodeSearchConfig,
+    NodeSearchMethod,
+    SearchConfig,
+)
 
 from noodly.config import Settings
 from noodly.models.artifacts import SourceArtifact
@@ -98,7 +104,12 @@ class Brain:
 
     async def search_nodes(self, query: str, limit: int = 10) -> list[dict]:
         """Semantic + keyword hybrid search over entity nodes."""
-        config = SearchConfig(limit=limit)
+        config = SearchConfig(
+            limit=limit,
+            node_config=NodeSearchConfig(
+                search_methods=[NodeSearchMethod.cosine_similarity, NodeSearchMethod.bm25],
+            ),
+        )
         results = await self._graphiti.search_(
             query=query,
             config=config,
@@ -117,7 +128,12 @@ class Brain:
 
     async def search_facts(self, query: str, limit: int = 10) -> list[dict]:
         """Semantic + keyword hybrid search over relationship edges (facts)."""
-        config = SearchConfig(limit=limit)
+        config = SearchConfig(
+            limit=limit,
+            edge_config=EdgeSearchConfig(
+                search_methods=[EdgeSearchMethod.cosine_similarity, EdgeSearchMethod.bm25],
+            ),
+        )
         results = await self._graphiti.search_(
             query=query,
             config=config,

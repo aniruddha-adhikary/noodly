@@ -21,7 +21,7 @@ class Settings(BaseSettings):
     falkordb_port: int = 6379
     falkordb_username: str | None = None
     falkordb_password: str | None = None
-    falkordb_database: str = "noodly"
+    falkordb_database: str = "default"
 
     # Paths
     brain_dir: Path = Path("./brain")
