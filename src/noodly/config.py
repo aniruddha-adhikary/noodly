@@ -40,10 +40,17 @@ class Settings(BaseSettings):
     storage_backend: str = "json"  # "json" or "postgresql"
     postgresql_dsn: str = ""
 
-    # Phase 4: semantic dedup
+    # Phase 4/8: semantic dedup
     enable_semantic_dedup: bool = False
     semantic_dedup_threshold: float = 0.92
     embedding_model: str = "text-embedding-3-large"
+    enable_ingestion_embeddings: bool = True  # embed claims at ingestion for semantic dedup
+    embedding_dim: int = 3072  # dimension for text-embedding-3-large
+
+    # Phase 8: claim promotion thresholds
+    promote_threshold: float = 0.15  # truth_score threshold for candidate → unverified
+    high_authority_threshold: float = 0.8  # source_authority threshold for auto-unverified
+    corroboration_count: int = 2  # independent sources needed for corroborated
 
     # Phase 4: conflict resolution
     enable_conflict_resolution: bool = False

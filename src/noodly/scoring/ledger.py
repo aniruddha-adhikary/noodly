@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -20,11 +21,11 @@ DECAY_RATES: dict[KnowledgeClass, float] = {
     KnowledgeClass.stateful: 0.95,
 }
 
-# Minimum truth_score for auto-promotion to "unverified"
-AUTO_PROMOTE_THRESHOLD = 0.3
-
-# Evidence count thresholds for auto-promotion
-CORROBORATION_EVIDENCE_COUNT = 2  # promote to corroborated with 2+ independent sources
+# Configurable promotion thresholds (overridable via constructor)
+DEFAULT_PROMOTE_THRESHOLD = 0.15
+DEFAULT_HIGH_AUTHORITY_THRESHOLD = 0.8
+DEFAULT_CORROBORATION_COUNT = 2
+DEFAULT_SEMANTIC_DEDUP_THRESHOLD = 0.92
 
 
 def _claim_fingerprint(claim: Claim) -> str:
@@ -34,6 +35,73 @@ def _claim_fingerprint(claim: Claim) -> str:
         f"|{claim.predicate.strip().lower()}"
         f"|{claim.object.strip().lower()}"
     )
+
+
+def _claim_text(claim: Claim) -> str:
+    """Convert claim to text for embedding."""
+    return f"{claim.subject} {claim.predicate} {claim.object}"
+
+
+def _cosine_similarity(a: list[float], b: list[float]) -> float:
+    """Cosine similarity between two vectors."""
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = math.sqrt(sum(x * x for x in a))
+    norm_b = math.sqrt(sum(x * x for x in b))
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
+class EmbeddingProvider:
+    """Async embedding provider using OpenAI API.
+
+    Used by FactLedger for ingestion-time semantic dedup.
+    Caches embeddings in memory to avoid redundant API calls.
+    """
+
+    def __init__(self, api_key: str, model: str = "text-embedding-3-large") -> None:
+        from openai import AsyncOpenAI
+
+        self._client = AsyncOpenAI(api_key=api_key)
+        self._model = model
+        self._cache: dict[str, list[float]] = {}
+
+    async def embed(self, text: str) -> list[float]:
+        """Embed a single text string."""
+        if text in self._cache:
+            return self._cache[text]
+        try:
+            response = await self._client.embeddings.create(
+                model=self._model, input=text
+            )
+            embedding = response.data[0].embedding
+            self._cache[text] = embedding
+            return embedding
+        except Exception:
+            logger.exception("Embedding failed for text: %.60s", text)
+            return []
+
+    async def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        """Embed multiple texts in a single API call."""
+        uncached = [t for t in texts if t not in self._cache]
+        if uncached:
+            batch_size = 2048
+            for i in range(0, len(uncached), batch_size):
+                batch = uncached[i : i + batch_size]
+                try:
+                    response = await self._client.embeddings.create(
+                        model=self._model, input=batch
+                    )
+                    for text, data in zip(batch, response.data):
+                        self._cache[text] = data.embedding
+                except Exception:
+                    logger.exception("Batch embedding failed for %d texts", len(batch))
+                    for text in batch:
+                        if text not in self._cache:
+                            self._cache[text] = []
+        return [self._cache.get(t, []) for t in texts]
 
 
 class FactLedger:
@@ -48,11 +116,21 @@ class FactLedger:
         self,
         ledger_path: Path,
         authority_registry: AuthorityRegistry | None = None,
+        embedding_provider: EmbeddingProvider | None = None,
+        promote_threshold: float = DEFAULT_PROMOTE_THRESHOLD,
+        high_authority_threshold: float = DEFAULT_HIGH_AUTHORITY_THRESHOLD,
+        corroboration_count: int = DEFAULT_CORROBORATION_COUNT,
+        semantic_dedup_threshold: float = DEFAULT_SEMANTIC_DEDUP_THRESHOLD,
     ) -> None:
         self._path = ledger_path
         self._claims: dict[str, Claim] = {}
         self._fingerprint_index: dict[str, str] = {}
         self._authority = authority_registry
+        self._embedder = embedding_provider
+        self._promote_threshold = promote_threshold
+        self._high_authority_threshold = high_authority_threshold
+        self._corroboration_count = corroboration_count
+        self._semantic_dedup_threshold = semantic_dedup_threshold
         self._load()
 
     def _load(self) -> None:
@@ -84,34 +162,71 @@ class FactLedger:
                 ev.source_authority = self._authority.get(ev.author, topic=topic)
 
     def _find_duplicate(self, claim: Claim) -> Claim | None:
-        """Check if a semantically equivalent claim already exists."""
+        """Check if an exact-match equivalent claim already exists."""
         fp = _claim_fingerprint(claim)
         existing_id = self._fingerprint_index.get(fp)
         if existing_id is None:
             return None
         return self._claims.get(existing_id)
 
+    def _find_semantic_duplicate(self, claim: Claim) -> Claim | None:
+        """Find the best semantic match above threshold using stored embeddings.
+
+        Only checks claims that already have embeddings persisted.
+        """
+        if not claim.embedding:
+            return None
+
+        best_match: Claim | None = None
+        best_score = 0.0
+
+        for existing in self._claims.values():
+            if not existing.embedding:
+                continue
+            similarity = _cosine_similarity(claim.embedding, existing.embedding)
+            if similarity > best_score and similarity >= self._semantic_dedup_threshold:
+                best_score = similarity
+                best_match = existing
+
+        if best_match:
+            logger.info(
+                "Semantic dedup (ingestion): '%.60s' matches '%.60s' (sim=%.3f)",
+                _claim_text(claim),
+                _claim_text(best_match),
+                best_score,
+            )
+
+        return best_match
+
+    def _merge_into(self, existing: Claim, new_claim: Claim) -> Claim:
+        """Merge new_claim's evidence into existing claim."""
+        seen_artifacts = {str(ev.artifact_id) for ev in existing.evidence}
+        for ev in new_claim.evidence:
+            if str(ev.artifact_id) not in seen_artifacts:
+                existing.evidence.append(ev)
+                seen_artifacts.add(str(ev.artifact_id))
+        existing.confidence = max(existing.confidence, new_claim.confidence)
+        if new_claim.last_confirmed_at:
+            existing.last_confirmed_at = new_claim.last_confirmed_at
+        else:
+            existing.last_confirmed_at = datetime.now(timezone.utc)
+        self._auto_promote(existing)
+        return existing
+
     def add_claim(self, claim: Claim) -> Claim:
         """Add a claim, deduplicating if an equivalent already exists.
 
-        If a duplicate is found (same subject+predicate+object), the new
-        evidence is merged into the existing claim instead of creating a
-        new entry.
+        Dedup order:
+        1. Exact fingerprint match (subject|predicate|object)
+        2. Semantic similarity match (if embeddings available)
+        3. Insert as new claim
         """
         self._apply_authority(claim)
 
+        # 1. Exact fingerprint dedup
         existing = self._find_duplicate(claim)
         if existing is not None:
-            seen_artifacts = {str(ev.artifact_id) for ev in existing.evidence}
-            for ev in claim.evidence:
-                if str(ev.artifact_id) not in seen_artifacts:
-                    existing.evidence.append(ev)
-                    seen_artifacts.add(str(ev.artifact_id))
-            existing.confidence = max(existing.confidence, claim.confidence)
-            if claim.last_confirmed_at:
-                existing.last_confirmed_at = claim.last_confirmed_at
-            # Auto-promote based on corroboration
-            self._auto_promote(existing)
+            self._merge_into(existing, claim)
             logger.info(
                 "Ledger: merged evidence into existing claim %s [%s] score=%.2f",
                 existing.id,
@@ -121,8 +236,22 @@ class FactLedger:
             self._save()
             return existing
 
-        if claim.status == ClaimStatus.candidate and claim.truth_score >= AUTO_PROMOTE_THRESHOLD:
-            claim.status = ClaimStatus.unverified
+        # 2. Semantic dedup (using stored embeddings)
+        if claim.embedding:
+            semantic_match = self._find_semantic_duplicate(claim)
+            if semantic_match is not None:
+                self._merge_into(semantic_match, claim)
+                logger.info(
+                    "Ledger: semantic-merged into claim %s [%s] score=%.2f",
+                    semantic_match.id,
+                    semantic_match.status.value,
+                    semantic_match.truth_score,
+                )
+                self._save()
+                return semantic_match
+
+        # 3. Insert as new — run promotion check
+        self._auto_promote(claim)
 
         self._claims[str(claim.id)] = claim
         self._fingerprint_index[_claim_fingerprint(claim)] = str(claim.id)
@@ -135,8 +264,45 @@ class FactLedger:
         )
         return claim
 
+    async def add_claim_async(self, claim: Claim) -> Claim:
+        """Add a claim with automatic embedding computation.
+
+        If an EmbeddingProvider is configured and the claim has no embedding,
+        computes one before dedup.
+        """
+        self._apply_authority(claim)
+
+        if self._embedder and not claim.embedding:
+            claim.embedding = await self._embedder.embed(_claim_text(claim))
+
+        return self.add_claim(claim)
+
+    async def add_claims_async(self, claims: list[Claim]) -> list[Claim]:
+        """Add multiple claims with batch embedding for efficiency.
+
+        Pre-embeds all claims in a single batch API call, then adds each
+        claim individually (benefiting from ingestion-time semantic dedup).
+        """
+        if self._embedder:
+            texts_to_embed = []
+            indices_to_embed = []
+            for i, claim in enumerate(claims):
+                if not claim.embedding:
+                    texts_to_embed.append(_claim_text(claim))
+                    indices_to_embed.append(i)
+
+            if texts_to_embed:
+                embeddings = await self._embedder.embed_batch(texts_to_embed)
+                for idx, embedding in zip(indices_to_embed, embeddings):
+                    claims[idx].embedding = embedding
+
+        results = []
+        for claim in claims:
+            results.append(self.add_claim(claim))
+        return results
+
     def add_claims(self, claims: list[Claim]) -> list[Claim]:
-        """Add multiple claims."""
+        """Add multiple claims (sync version, no embedding computation)."""
         results = []
         for claim in claims:
             results.append(self.add_claim(claim))
@@ -266,20 +432,21 @@ class FactLedger:
         return decayed
 
     def _auto_promote(self, claim: Claim) -> None:
-        """Auto-promote claim status based on evidence count and score.
+        """Auto-promote claim status based on evidence, authority, and score.
 
         Promotion ladder:
-        - candidate → unverified: truth_score >= AUTO_PROMOTE_THRESHOLD
-        - candidate/unverified → corroborated: 2+ independent supporting sources
+        - candidate → unverified: truth_score >= promote_threshold OR
+          any evidence has source_authority >= high_authority_threshold
+        - candidate/unverified → corroborated: N+ independent supporting sources
         """
         independent_sources = len(
             {str(ev.artifact_id) for ev in claim.evidence if ev.supports}
         )
 
-        # Corroboration check first — 2+ independent sources is strong signal
+        # Corroboration check first — N+ independent sources is strong signal
         if (
             claim.status in (ClaimStatus.candidate, ClaimStatus.unverified)
-            and independent_sources >= CORROBORATION_EVIDENCE_COUNT
+            and independent_sources >= self._corroboration_count
         ):
             claim.status = ClaimStatus.corroborated
             claim.last_confirmed_at = datetime.now(timezone.utc)
@@ -290,11 +457,25 @@ class FactLedger:
             )
             return
 
-        # Score-based promotion for single-source claims
-        if (
-            claim.status == ClaimStatus.candidate
-            and claim.truth_score >= AUTO_PROMOTE_THRESHOLD
-        ):
+        if claim.status != ClaimStatus.candidate:
+            return
+
+        # High-authority source promotes to unverified immediately
+        max_authority = max(
+            (ev.source_authority for ev in claim.evidence if ev.supports),
+            default=0.0,
+        )
+        if max_authority >= self._high_authority_threshold:
+            claim.status = ClaimStatus.unverified
+            logger.info(
+                "Auto-promoted %s to unverified (high authority=%.2f)",
+                claim.id,
+                max_authority,
+            )
+            return
+
+        # Score-based promotion
+        if claim.truth_score >= self._promote_threshold:
             claim.status = ClaimStatus.unverified
             logger.info(
                 "Auto-promoted %s to unverified (score=%.2f)",
@@ -313,6 +494,18 @@ class FactLedger:
         if promoted > 0:
             self._save()
         return promoted
+
+    def promotion_stats(self) -> dict[str, int]:
+        """Return counts of claims by status."""
+        stats: dict[str, int] = {}
+        for claim in self._claims.values():
+            key = claim.status.value
+            stats[key] = stats.get(key, 0) + 1
+        return stats
+
+    def embedded_count(self) -> int:
+        """Return count of claims that have stored embeddings."""
+        return sum(1 for c in self._claims.values() if c.embedding)
 
     @property
     def count(self) -> int:

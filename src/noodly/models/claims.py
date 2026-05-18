@@ -81,6 +81,9 @@ class Claim(BaseModel):
     # Grouping
     group_id: str = "default"
 
+    # Embedding (persisted for efficient semantic dedup at ingestion time)
+    embedding: list[float] = Field(default_factory=list, exclude=False)
+
     # Truth maintenance
     superseded_by: UUID | None = None
     supersedes: UUID | None = None
