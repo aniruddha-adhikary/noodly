@@ -62,7 +62,7 @@ def _edge_to_claim(edge: EntityEdge) -> Claim | None:
     Returns ``None`` if the edge does not carry the noodly claim marker.
     """
     attrs = edge.attributes
-    if not attrs.get(CLAIM_MARKER):
+    if not attrs or not attrs.get(CLAIM_MARKER):
         return None
 
     evidence_raw = json.loads(attrs.get("evidence_json", "[]"))
@@ -88,7 +88,11 @@ def _edge_to_claim(edge: EntityEdge) -> Claim | None:
         status=ClaimStatus(attrs.get("status", "candidate")),
         knowledge_class=KnowledgeClass(attrs.get("knowledge_class", "process")),
         evidence=evidence,
-        created_at=datetime.fromisoformat(attrs["created_at"]),
+        created_at=(
+            datetime.fromisoformat(attrs["created_at"])
+            if attrs.get("created_at")
+            else edge.created_at
+        ),
         valid_from=_parse_optional_dt(attrs.get("valid_from", "")),
         valid_until=_parse_optional_dt(attrs.get("valid_until", "")),
         last_confirmed_at=_parse_optional_dt(attrs.get("last_confirmed_at", "")),

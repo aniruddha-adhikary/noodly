@@ -168,45 +168,66 @@ def claims(status: str, limit: int) -> None:
     settings = get_settings()
     ledger, brain = _build_ledger(settings)
 
-    if ledger.is_async_backend:
-        _run(ledger.load_async())
-
     claim_status = None
     if status:
         try:
             claim_status = ClaimStatus(status)
         except ValueError:
             console.print(f"[red]Unknown status: {status}[/red]")
-            if brain:
-                _run(brain.close())
             return
 
-    results = ledger.list_claims(status=claim_status, limit=limit)
+    async def _claims():
+        if ledger.is_async_backend:
+            await ledger.load_async()
 
-    if not results:
-        console.print("[yellow]No claims found.[/yellow]")
-        return
+        results = ledger.list_claims(status=claim_status, limit=limit)
 
-    table = Table(title=f"Claims ({len(results)})")
-    table.add_column("Score", style="bold", justify="right")
-    table.add_column("Status", style="cyan")
-    table.add_column("Class")
-    table.add_column("Claim", style="green")
-    table.add_column("Evidence")
+        if not results:
+            console.print("[yellow]No claims found.[/yellow]")
+        else:
+            table = Table(title=f"Claims ({len(results)})")
+            table.add_column("Score", style="bold", justify="right")
+            table.add_column("Status", style="cyan")
+            table.add_column("Class")
+            table.add_column("Claim", style="green")
+            table.add_column("Evidence")
 
-    for c in results:
-        table.add_row(
-            f"{c.truth_score:.2f}",
-            c.status.value,
-            c.knowledge_class.value,
-            c.natural_language[:80],
-            str(len(c.evidence)),
-        )
+            for c in results:
+                table.add_row(
+                    f"{c.truth_score:.2f}",
+                    c.status.value,
+                    c.knowledge_class.value,
+                    c.natural_language[:80],
+                    str(len(c.evidence)),
+                )
 
-    console.print(table)
+            console.print(table)
 
-    if brain:
-        _run(brain.close())
+        if brain:
+            await brain.close()
+
+    if ledger.is_async_backend:
+        _run(_claims())
+    else:
+        results = ledger.list_claims(status=claim_status, limit=limit)
+        if not results:
+            console.print("[yellow]No claims found.[/yellow]")
+            return
+        table = Table(title=f"Claims ({len(results)})")
+        table.add_column("Score", style="bold", justify="right")
+        table.add_column("Status", style="cyan")
+        table.add_column("Class")
+        table.add_column("Claim", style="green")
+        table.add_column("Evidence")
+        for c in results:
+            table.add_row(
+                f"{c.truth_score:.2f}",
+                c.status.value,
+                c.knowledge_class.value,
+                c.natural_language[:80],
+                str(len(c.evidence)),
+            )
+        console.print(table)
 
 
 @cli.command()
@@ -215,36 +236,40 @@ def stats() -> None:
     settings = get_settings()
     ledger, brain = _build_ledger(settings)
 
+    def _print_stats(all_claims):
+        status_counts: dict[str, int] = {}
+        class_counts: dict[str, int] = {}
+        for c in all_claims:
+            status_counts[c.status.value] = status_counts.get(c.status.value, 0) + 1
+            class_counts[c.knowledge_class.value] = class_counts.get(c.knowledge_class.value, 0) + 1
+
+        console.print("\n[bold]Noodly Brain Stats[/bold]")
+        console.print(f"Total claims: {len(all_claims)}")
+
+        if all_claims:
+            avg_score = sum(c.truth_score for c in all_claims) / len(all_claims)
+            console.print(f"Average truth score: {avg_score:.3f}")
+
+        if status_counts:
+            console.print("\n[bold]By Status:[/bold]")
+            for s, count in sorted(status_counts.items()):
+                console.print(f"  {s}: {count}")
+
+        if class_counts:
+            console.print("\n[bold]By Knowledge Class:[/bold]")
+            for k, count in sorted(class_counts.items()):
+                console.print(f"  {k}: {count}")
+
     if ledger.is_async_backend:
-        _run(ledger.load_async())
+        async def _stats():
+            await ledger.load_async()
+            _print_stats(ledger.list_claims(limit=10000))
+            if brain:
+                await brain.close()
 
-    all_claims = ledger.list_claims(limit=10000)
-
-    status_counts: dict[str, int] = {}
-    class_counts: dict[str, int] = {}
-    for c in all_claims:
-        status_counts[c.status.value] = status_counts.get(c.status.value, 0) + 1
-        class_counts[c.knowledge_class.value] = class_counts.get(c.knowledge_class.value, 0) + 1
-
-    console.print("\n[bold]Noodly Brain Stats[/bold]")
-    console.print(f"Total claims: {len(all_claims)}")
-
-    if all_claims:
-        avg_score = sum(c.truth_score for c in all_claims) / len(all_claims)
-        console.print(f"Average truth score: {avg_score:.3f}")
-
-    if status_counts:
-        console.print("\n[bold]By Status:[/bold]")
-        for s, count in sorted(status_counts.items()):
-            console.print(f"  {s}: {count}")
-
-    if class_counts:
-        console.print("\n[bold]By Knowledge Class:[/bold]")
-        for k, count in sorted(class_counts.items()):
-            console.print(f"  {k}: {count}")
-
-    if brain:
-        _run(brain.close())
+        _run(_stats())
+    else:
+        _print_stats(ledger.list_claims(limit=10000))
 
 
 @cli.command()
@@ -254,18 +279,23 @@ def project() -> None:
 
     settings = get_settings()
     ledger, brain = _build_ledger(settings)
-
-    if ledger.is_async_backend:
-        _run(ledger.load_async())
-
     projector = MarkdownProjector(settings.brain_dir)
 
-    all_claims = ledger.list_claims(limit=10000)
-    written = projector.project(all_claims)
-    console.print(f"[green]Projected {written} Markdown files to {settings.brain_dir}[/green]")
+    if ledger.is_async_backend:
+        async def _project():
+            await ledger.load_async()
+            all_claims = ledger.list_claims(limit=10000)
+            written = projector.project(all_claims)
+            msg = f"[green]Projected {written} Markdown files to {settings.brain_dir}[/green]"
+            console.print(msg)
+            if brain:
+                await brain.close()
 
-    if brain:
-        _run(brain.close())
+        _run(_project())
+    else:
+        all_claims = ledger.list_claims(limit=10000)
+        written = projector.project(all_claims)
+        console.print(f"[green]Projected {written} Markdown files to {settings.brain_dir}[/green]")
 
 
 @cli.command()
