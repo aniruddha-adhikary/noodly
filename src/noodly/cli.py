@@ -12,7 +12,7 @@ import click
 from rich.console import Console
 from rich.table import Table
 
-from noodly.config import get_settings
+from noodly.config import Settings, get_settings
 
 console = Console()
 
@@ -20,6 +20,45 @@ console = Console()
 def _run(coro):
     """Run an async coroutine from sync Click commands."""
     return asyncio.run(coro)
+
+
+def _make_ledger(
+    settings: Settings,
+    *,
+    authority_registry=None,
+    **kwargs,
+):
+    """Create the right FactLedger based on backend configuration.
+
+    When ``NOODLY_USE_GRAPHITI_BACKEND`` is true, creates a
+    :class:`GraphitiBackend`-backed ledger (requires async load).
+    Otherwise falls back to JSON file storage.
+    """
+    from noodly.scoring.ledger import FactLedger
+
+    if settings.use_graphiti_backend:
+        from noodly.graph.brain import Brain
+        from noodly.storage.graphiti_backend import GraphitiBackend
+
+        brain = Brain(settings)
+        backend = GraphitiBackend(brain)
+        return FactLedger(backend, authority_registry=authority_registry, **kwargs), brain
+    backend = settings.brain_dir / "ledger.json"
+    return FactLedger(backend, authority_registry=authority_registry, **kwargs), None
+
+
+async def _load_ledger(ledger, brain=None):
+    """Initialize an async-backed ledger (load claims from Graphiti)."""
+    if brain is not None:
+        await brain.initialize()
+    if ledger.is_async_backend:
+        await ledger.load_async()
+
+
+async def _close_brain(brain):
+    """Close the brain if it was created."""
+    if brain is not None:
+        await brain.close()
 
 
 @click.group()
@@ -154,11 +193,10 @@ def claims(status: str, limit: int, as_of: str) -> None:
     """List claims from the fact ledger."""
     from noodly.models.claims import ClaimStatus
     from noodly.scoring.authority import AuthorityRegistry
-    from noodly.scoring.ledger import FactLedger
 
     settings = get_settings()
     authority = AuthorityRegistry(settings.brain_dir / "authority.json")
-    ledger = FactLedger(settings.brain_dir / "ledger.json", authority_registry=authority)
+    ledger, brain = _make_ledger(settings, authority_registry=authority)
 
     claim_status = None
     if status:
@@ -178,7 +216,11 @@ def claims(status: str, limit: int, as_of: str) -> None:
             console.print(f"[red]Invalid date format: {as_of}[/red]")
             return
 
-    results = ledger.list_claims(status=claim_status, limit=limit, as_of_valid=as_of_valid)
+    async def _claims():
+        await _load_ledger(ledger, brain)
+        return ledger.list_claims(status=claim_status, limit=limit, as_of_valid=as_of_valid)
+
+    results = _run(_claims())
 
     if not results:
         console.print("[yellow]No claims found.[/yellow]")
@@ -206,12 +248,14 @@ def claims(status: str, limit: int, as_of: str) -> None:
 @cli.command()
 def stats() -> None:
     """Show brain statistics."""
-    from noodly.scoring.ledger import FactLedger
-
     settings = get_settings()
-    ledger = FactLedger(settings.brain_dir / "ledger.json")
+    ledger, brain = _make_ledger(settings)
 
-    all_claims = ledger.list_claims(limit=10000)
+    async def _stats():
+        await _load_ledger(ledger, brain)
+        return ledger.list_claims(limit=10000)
+
+    all_claims = _run(_stats())
 
     status_counts: dict[str, int] = {}
     class_counts: dict[str, int] = {}
@@ -242,14 +286,17 @@ def stats() -> None:
 def project(full: bool) -> None:
     """Project the current brain state to Markdown files."""
     from noodly.projection.markdown import MarkdownProjector
-    from noodly.scoring.ledger import FactLedger
     from noodly.scoring.topic_classifier import TopicClassifier
 
     settings = get_settings()
-    ledger = FactLedger(settings.brain_dir / "ledger.json")
+    ledger, brain = _make_ledger(settings)
     projector = MarkdownProjector(settings.brain_dir)
 
-    all_claims = ledger.list_claims(limit=10000)
+    async def _load():
+        await _load_ledger(ledger, brain)
+        return ledger.list_claims(limit=10000)
+
+    all_claims = _run(_load())
 
     # Classify topics if enabled
     topic_map: dict[str, list[str]] | None = None
@@ -508,10 +555,10 @@ def conflicts_list(limit: int) -> None:
 def conflicts_detect() -> None:
     """Detect conflicts among existing claims."""
     from noodly.resolution.detector import ConflictDetector
-    from noodly.scoring.ledger import FactLedger
 
     settings = get_settings()
-    ledger = FactLedger(settings.brain_dir / "ledger.json")
+    ledger, brain = _make_ledger(settings)
+    _run(_load_ledger(ledger, brain))
     detector = ConflictDetector(
         similarity_threshold=settings.conflict_similarity_threshold,
     )
@@ -560,12 +607,12 @@ def conflicts_resolve(auto_threshold: float | None, strategy: str | None) -> Non
     from noodly.resolution.resolver import ConflictResolver
     from noodly.resolution.strategies import AutoResolveStrategy
     from noodly.scoring.authority import AuthorityRegistry
-    from noodly.scoring.ledger import FactLedger
     from noodly.tracking.changelog import ChangeLog
 
     settings = get_settings()
     authority = AuthorityRegistry(settings.brain_dir / "authority.json")
-    ledger = FactLedger(settings.brain_dir / "ledger.json", authority_registry=authority)
+    ledger, brain = _make_ledger(settings, authority_registry=authority)
+    _run(_load_ledger(ledger, brain))
     audit = ResolutionAudit(settings.brain_dir / "resolutions.json")
     changelog = ChangeLog(settings.brain_dir / "changelog.json")
 
@@ -653,14 +700,14 @@ def gitlab_sync(message: str) -> None:
     """Full sync: render all claims and push to GitLab."""
     from noodly.dispatch.gitlab_handler import GitLabConfig
     from noodly.projection.gitlab import GitLabProjector
-    from noodly.scoring.ledger import FactLedger
 
     settings = get_settings()
     if not settings.gitlab_token:
         console.print("[red]NOODLY_GITLAB_TOKEN not configured.[/red]")
         return
 
-    ledger = FactLedger(settings.brain_dir / "ledger.json")
+    ledger, brain = _make_ledger(settings)
+    _run(_load_ledger(ledger, brain))
     claims_list = ledger.list_claims(limit=10000)
     if not claims_list:
         console.print("[yellow]No claims in ledger.[/yellow]")
@@ -693,14 +740,14 @@ def gitlab_push(subjects: tuple[str, ...], message: str) -> None:
     """Incremental push: update only changed entities in GitLab."""
     from noodly.dispatch.gitlab_handler import GitLabConfig
     from noodly.projection.gitlab import GitLabProjector
-    from noodly.scoring.ledger import FactLedger
 
     settings = get_settings()
     if not settings.gitlab_token:
         console.print("[red]NOODLY_GITLAB_TOKEN not configured.[/red]")
         return
 
-    ledger = FactLedger(settings.brain_dir / "ledger.json")
+    ledger, brain = _make_ledger(settings)
+    _run(_load_ledger(ledger, brain))
     claims_list = ledger.list_claims(limit=10000)
     if not claims_list:
         console.print("[yellow]No claims in ledger.[/yellow]")
@@ -733,14 +780,14 @@ def gitlab_diff() -> None:
     """Preview what would change on next sync (dry run)."""
     from noodly.dispatch.gitlab_handler import GitLabConfig
     from noodly.projection.gitlab import GitLabProjector
-    from noodly.scoring.ledger import FactLedger
 
     settings = get_settings()
     if not settings.gitlab_token:
         console.print("[red]NOODLY_GITLAB_TOKEN not configured.[/red]")
         return
 
-    ledger = FactLedger(settings.brain_dir / "ledger.json")
+    ledger, brain = _make_ledger(settings)
+    _run(_load_ledger(ledger, brain))
     claims_list = ledger.list_claims(limit=10000)
     if not claims_list:
         console.print("[yellow]No claims in ledger.[/yellow]")
@@ -825,17 +872,17 @@ def cache_clear(level: str) -> None:
 def promote() -> None:
     """Auto-promote all eligible claims based on evidence, authority, and score."""
     from noodly.scoring.authority import AuthorityRegistry
-    from noodly.scoring.ledger import FactLedger
 
     settings = get_settings()
     authority = AuthorityRegistry(settings.brain_dir / "authority.json")
-    ledger = FactLedger(
-        settings.brain_dir / "ledger.json",
+    ledger, brain = _make_ledger(
+        settings,
         authority_registry=authority,
         promote_threshold=settings.promote_threshold,
         high_authority_threshold=settings.high_authority_threshold,
         corroboration_count=settings.corroboration_count,
     )
+    _run(_load_ledger(ledger, brain))
 
     promoted = ledger.auto_promote_all()
     pstats = ledger.promotion_stats()
@@ -858,10 +905,10 @@ def promote() -> None:
 def promote_claim_cmd(claim_id: str, status: str) -> None:
     """Manually promote or demote a single claim's status."""
     from noodly.models.claims import ClaimStatus
-    from noodly.scoring.ledger import FactLedger
 
     settings = get_settings()
-    ledger = FactLedger(settings.brain_dir / "ledger.json")
+    ledger, brain = _make_ledger(settings)
+    _run(_load_ledger(ledger, brain))
 
     new_status = ClaimStatus(status)
     result = ledger.promote_claim(claim_id, new_status)
@@ -879,10 +926,9 @@ def promote_claim_cmd(claim_id: str, status: str) -> None:
 @cli.command(name="embedding-stats")
 def embedding_stats() -> None:
     """Show embedding coverage statistics for stored claims."""
-    from noodly.scoring.ledger import FactLedger
-
     settings = get_settings()
-    ledger = FactLedger(settings.brain_dir / "ledger.json")
+    ledger, brain = _make_ledger(settings)
+    _run(_load_ledger(ledger, brain))
 
     total = ledger.count
     embedded = ledger.embedded_count()
@@ -907,7 +953,7 @@ def embedding_stats() -> None:
 @click.option("--batch-size", default=100, help="Claims per API batch")
 def embed_claims(batch_size: int) -> None:
     """Backfill embeddings for claims that don't have them yet."""
-    from noodly.scoring.ledger import FactLedger, _claim_text
+    from noodly.scoring.ledger import _claim_text
 
     settings = get_settings()
 
@@ -915,7 +961,8 @@ def embed_claims(batch_size: int) -> None:
         console.print("[red]Error: NOODLY_OPENAI_API_KEY not set[/red]")
         raise SystemExit(1)
 
-    ledger = FactLedger(settings.brain_dir / "ledger.json")
+    ledger, brain = _make_ledger(settings)
+    _run(_load_ledger(ledger, brain))
 
     all_claims = ledger.list_claims(limit=100000)
     missing = [c for c in all_claims if not c.embedding]
