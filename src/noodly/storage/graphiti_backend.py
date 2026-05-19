@@ -217,12 +217,16 @@ class GraphitiBackend:
     async def load_claims_async(self) -> dict[str, Claim]:
         """Load all CLAIM edges from FalkorDB."""
         from graphiti_core.edges import EntityEdge
+        from graphiti_core.errors import GroupsEdgesNotFoundError
         from graphiti_core.nodes import EntityNode
 
-        edges = await EntityEdge.get_by_group_ids(
-            self._driver,
-            group_ids=[self._group_id],
-        )
+        try:
+            edges = await EntityEdge.get_by_group_ids(
+                self._driver,
+                group_ids=[self._group_id],
+            )
+        except GroupsEdgesNotFoundError:
+            return {}
 
         claim_edges = [
             e for e in edges
