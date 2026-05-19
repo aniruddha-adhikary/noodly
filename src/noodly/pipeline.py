@@ -15,6 +15,7 @@ from noodly.extraction.extractor import ClaimExtractor
 from noodly.graph.brain import Brain
 from noodly.models.artifacts import SourceArtifact
 from noodly.models.claims import Claim, ClaimEvidence, ClaimStatus, KnowledgeClass
+from noodly.models.edge_types import CLAIM_EDGE_TYPE, CLAIM_EXTRACTION_INSTRUCTIONS, ClaimEdge
 from noodly.parsing.boilerplate import BoilerplateStripper
 from noodly.parsing.chunker import chunk_markdown, content_hash
 from noodly.parsing.parser import DocumentParser
@@ -57,25 +58,7 @@ class Pipeline:
         )
         self._authority = AuthorityRegistry(settings.brain_dir / "authority.json")
 
-        # Phase 8: embedding provider for ingestion-time semantic dedup
-        embedding_provider = None
-        if settings.enable_ingestion_embeddings and settings.openai_api_key:
-            from noodly.scoring.ledger import EmbeddingProvider
-
-            embedding_provider = EmbeddingProvider(
-                api_key=settings.openai_api_key,
-                model=settings.embedding_model,
-            )
-
-        self._ledger = FactLedger(
-            settings.brain_dir / "ledger.json",
-            authority_registry=self._authority,
-            embedding_provider=embedding_provider,
-            promote_threshold=settings.promote_threshold,
-            high_authority_threshold=settings.high_authority_threshold,
-            corroboration_count=settings.corroboration_count,
-            semantic_dedup_threshold=settings.semantic_dedup_threshold,
-        )
+        self._ledger = self._build_ledger(settings)
         self._projector = MarkdownProjector(settings.brain_dir)
 
         # Phase 3 modules
@@ -180,9 +163,33 @@ class Pipeline:
                 cache_path=settings.brain_dir / "topic_cache.json",
             )
 
+    def _build_ledger(self, settings: Settings) -> FactLedger:
+        """Build the FactLedger with the configured backend."""
+        if settings.use_graphiti_backend:
+            from noodly.storage.graphiti_backend import GraphitiBackend
+
+            backend = GraphitiBackend(self._brain)
+            return FactLedger(
+                backend=backend,
+                authority_registry=self._authority,
+                promote_threshold=settings.promote_threshold,
+                high_authority_threshold=settings.high_authority_threshold,
+                corroboration_count=settings.corroboration_count,
+            )
+
+        return FactLedger(
+            backend=settings.brain_dir / "ledger.json",
+            authority_registry=self._authority,
+            promote_threshold=settings.promote_threshold,
+            high_authority_threshold=settings.high_authority_threshold,
+            corroboration_count=settings.corroboration_count,
+        )
+
     async def initialize(self) -> None:
-        """Set up graph indices."""
+        """Set up graph indices and load async backends."""
         await self._brain.initialize()
+        if self._ledger.is_async_backend:
+            await self._ledger.load_async()
         logger.info("Pipeline initialized")
 
     async def run(self) -> dict[str, int]:
@@ -201,10 +208,10 @@ class Pipeline:
             all_claims.extend(claims)
             stats["cached_chunks"] += cached
 
-        # Phase 8: ingestion-time semantic dedup via add_claims_async
-        # Embeds claims in batch, then each claim is deduped against stored
-        # embeddings inside add_claim() — no separate post-hoc pass needed.
-        stored = await self._ledger.add_claims_async(all_claims)
+        if self._ledger.is_async_backend:
+            stored = await self._ledger.add_claims_async(all_claims)
+        else:
+            stored = self._ledger.add_claims(all_claims)
         stats["claims"] = len(stored)
         stats["embedded"] = self._ledger.embedded_count()
         stats.update(self._ledger.promotion_stats())
@@ -323,14 +330,41 @@ class Pipeline:
         ):
             await self._run_qa_agent(artifact, markdown, content_diff)
 
-        # 5. Ingest into Graphiti
+        # 5. Ingest into Graphiti (unified extraction when using Graphiti backend)
+        graphiti_claims: list[Claim] = []
         try:
             artifact.body = markdown
-            await self._brain.ingest_artifact(artifact)
+            if self._settings.use_graphiti_backend:
+                results = await self._brain.ingest_artifact(
+                    artifact,
+                    edge_types={CLAIM_EDGE_TYPE: ClaimEdge},
+                    custom_extraction_instructions=CLAIM_EXTRACTION_INSTRUCTIONS,
+                )
+                graphiti_claims = self._edges_to_claims(results, artifact)
+                logger.info(
+                    "Unified extraction: %d claims from artifact %s",
+                    len(graphiti_claims),
+                    artifact.id,
+                )
+            else:
+                await self._brain.ingest_artifact(artifact)
         except Exception:
             logger.exception("Failed to ingest artifact %s", artifact.id)
 
-        # 6. Chunk and extract (with caching + parallel dispatch)
+        # If unified extraction produced claims, skip separate ClaimExtractor
+        if graphiti_claims:
+            for claim in graphiti_claims:
+                self._changelog.emit(
+                    ChangeEvent(
+                        change_type=ChangeType.claim_added,
+                        entity_id=claim.subject,
+                        source_uri=source_uri,
+                        payload={"predicate": claim.predicate, "object": claim.object},
+                    )
+                )
+            return graphiti_claims, 0
+
+        # 6. Chunk and extract (with caching + parallel dispatch) — JSON backend path
         chunks = chunk_markdown(markdown, max_chars=self._chunk_size)
         all_claims: list[Claim] = []
         cached_count = 0
@@ -412,6 +446,68 @@ class Pipeline:
             )
 
         return all_claims, cached_count
+
+    def _edges_to_claims(
+        self, results: object, artifact: SourceArtifact
+    ) -> list[Claim]:
+        """Convert CLAIM-typed Graphiti edges to Claim objects.
+
+        Reads the typed attributes set by Graphiti's LLM extraction
+        (predicate, natural_language, knowledge_class, confidence, source_span)
+        and wraps them into Claim objects with evidence metadata.
+        """
+        from graphiti_core.graphiti import AddEpisodeResults
+
+        if not isinstance(results, AddEpisodeResults):
+            return []
+
+        claims: list[Claim] = []
+        # Build a node UUID → name map for subject/object
+        node_map: dict[str, str] = {}
+        for node in results.nodes:
+            node_map[node.uuid] = node.name
+
+        for edge in results.edges:
+            if edge.name != CLAIM_EDGE_TYPE:
+                continue
+
+            attrs = edge.attributes or {}
+
+            # Parse knowledge class
+            klass = KnowledgeClass.process
+            raw_kc = attrs.get("knowledge_class", "process")
+            if raw_kc:
+                try:
+                    klass = KnowledgeClass(raw_kc)
+                except ValueError:
+                    pass
+
+            subject = node_map.get(edge.source_node_uuid, "")
+            obj = node_map.get(edge.target_node_uuid, "")
+
+            claim = Claim(
+                subject=subject,
+                predicate=attrs.get("predicate", edge.fact or ""),
+                object=obj,
+                natural_language=attrs.get("natural_language", edge.fact or ""),
+                confidence=float(attrs.get("confidence", 0.5)),
+                knowledge_class=klass,
+                status=ClaimStatus.candidate,
+                group_id=self._settings.group_id,
+                embedding=edge.fact_embedding or [],
+                evidence=[
+                    ClaimEvidence(
+                        artifact_id=artifact.id,
+                        supports=True,
+                        source_span=attrs.get("source_span", ""),
+                        source_artifact=artifact.source_uri or str(artifact.id),
+                        author=artifact.author,
+                    )
+                ],
+            )
+            claims.append(claim)
+
+        return claims
 
     def _deserialize_cached_claims(
         self, claims_data: list[dict], artifact: SourceArtifact
@@ -511,9 +607,21 @@ class Pipeline:
             author=author,
         )
 
-        await self._brain.ingest_artifact(artifact)
-        claims = await self._extractor.extract(artifact)
-        stored = self._ledger.add_claims(claims)
+        if self._settings.use_graphiti_backend:
+            results = await self._brain.ingest_artifact(
+                artifact,
+                edge_types={CLAIM_EDGE_TYPE: ClaimEdge},
+                custom_extraction_instructions=CLAIM_EXTRACTION_INSTRUCTIONS,
+            )
+            claims = self._edges_to_claims(results, artifact)
+        else:
+            await self._brain.ingest_artifact(artifact)
+            claims = await self._extractor.extract(artifact)
+
+        if self._ledger.is_async_backend:
+            stored = await self._ledger.add_claims_async(claims)
+        else:
+            stored = self._ledger.add_claims(claims)
 
         all_claims = self._ledger.list_claims(limit=10000)
         projected = self._projector.project(all_claims)

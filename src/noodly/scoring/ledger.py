@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
-import json
 import logging
-import math
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from noodly.models.claims import Claim, ClaimStatus, KnowledgeClass
 from noodly.scoring.authority import AuthorityRegistry
+from noodly.storage.json_backend import JSONBackend
+
+if TYPE_CHECKING:
+    from noodly.storage import LedgerBackend
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +28,6 @@ DECAY_RATES: dict[KnowledgeClass, float] = {
 DEFAULT_PROMOTE_THRESHOLD = 0.15
 DEFAULT_HIGH_AUTHORITY_THRESHOLD = 0.8
 DEFAULT_CORROBORATION_COUNT = 2
-DEFAULT_SEMANTIC_DEDUP_THRESHOLD = 0.92
 
 
 def _claim_fingerprint(claim: Claim) -> str:
@@ -42,113 +44,87 @@ def _claim_text(claim: Claim) -> str:
     return f"{claim.subject} {claim.predicate} {claim.object}"
 
 
-def _cosine_similarity(a: list[float], b: list[float]) -> float:
-    """Cosine similarity between two vectors."""
-    if not a or not b or len(a) != len(b):
-        return 0.0
-    dot = sum(x * y for x, y in zip(a, b))
-    norm_a = math.sqrt(sum(x * x for x in a))
-    norm_b = math.sqrt(sum(x * x for x in b))
-    if norm_a == 0 or norm_b == 0:
-        return 0.0
-    return dot / (norm_a * norm_b)
-
-
-class EmbeddingProvider:
-    """Async embedding provider using OpenAI API.
-
-    Used by FactLedger for ingestion-time semantic dedup.
-    Caches embeddings in memory to avoid redundant API calls.
-    """
-
-    def __init__(self, api_key: str, model: str = "text-embedding-3-large") -> None:
-        from openai import AsyncOpenAI
-
-        self._client = AsyncOpenAI(api_key=api_key)
-        self._model = model
-        self._cache: dict[str, list[float]] = {}
-
-    async def embed(self, text: str) -> list[float]:
-        """Embed a single text string."""
-        if text in self._cache:
-            return self._cache[text]
-        try:
-            response = await self._client.embeddings.create(
-                model=self._model, input=text
-            )
-            embedding = response.data[0].embedding
-            self._cache[text] = embedding
-            return embedding
-        except Exception:
-            logger.exception("Embedding failed for text: %.60s", text)
-            return []
-
-    async def embed_batch(self, texts: list[str]) -> list[list[float]]:
-        """Embed multiple texts in a single API call."""
-        uncached = [t for t in texts if t not in self._cache]
-        if uncached:
-            batch_size = 2048
-            for i in range(0, len(uncached), batch_size):
-                batch = uncached[i : i + batch_size]
-                try:
-                    response = await self._client.embeddings.create(
-                        model=self._model, input=batch
-                    )
-                    for text, data in zip(batch, response.data):
-                        self._cache[text] = data.embedding
-                except Exception:
-                    logger.exception("Batch embedding failed for %d texts", len(batch))
-                    for text in batch:
-                        if text not in self._cache:
-                            self._cache[text] = []
-        return [self._cache.get(t, []) for t in texts]
-
-
 class FactLedger:
-    """JSON-file-backed fact ledger (v1 — Postgres later).
+    """Backend-agnostic fact ledger with bitemporal claim storage and truth maintenance.
 
     Stores claims with bitemporal metadata:
     - ``valid_from`` / ``valid_until`` — when the fact is true in the world
     - ``created_at`` — when the system first learned it (transaction time)
+
+    The storage layer is pluggable via a ``LedgerBackend``.  Pass a ``Path``
+    for backward-compatible JSON storage, or a
+    :class:`~noodly.storage.graphiti_backend.GraphitiBackend` to store claims
+    as Graphiti edges.
     """
 
     def __init__(
         self,
-        ledger_path: Path,
+        backend: LedgerBackend | Path,
         authority_registry: AuthorityRegistry | None = None,
-        embedding_provider: EmbeddingProvider | None = None,
         promote_threshold: float = DEFAULT_PROMOTE_THRESHOLD,
         high_authority_threshold: float = DEFAULT_HIGH_AUTHORITY_THRESHOLD,
         corroboration_count: int = DEFAULT_CORROBORATION_COUNT,
-        semantic_dedup_threshold: float = DEFAULT_SEMANTIC_DEDUP_THRESHOLD,
     ) -> None:
-        self._path = ledger_path
+        if isinstance(backend, Path):
+            self._backend: LedgerBackend = JSONBackend(backend)
+        else:
+            self._backend = backend
+
         self._claims: dict[str, Claim] = {}
         self._fingerprint_index: dict[str, str] = {}
         self._authority = authority_registry
-        self._embedder = embedding_provider
         self._promote_threshold = promote_threshold
         self._high_authority_threshold = high_authority_threshold
         self._corroboration_count = corroboration_count
-        self._semantic_dedup_threshold = semantic_dedup_threshold
-        self._load()
+
+        if not self.is_async_backend:
+            self._load()
+
+    @property
+    def is_async_backend(self) -> bool:
+        """Whether the current backend requires async operations."""
+        from noodly.storage.graphiti_backend import GraphitiBackend
+
+        return isinstance(self._backend, GraphitiBackend)
 
     def _load(self) -> None:
-        if self._path.exists():
-            try:
-                data = json.loads(self._path.read_text())
-                for item in data:
-                    claim = Claim(**item)
-                    self._claims[str(claim.id)] = claim
-                    fp = _claim_fingerprint(claim)
-                    self._fingerprint_index[fp] = str(claim.id)
-            except (json.JSONDecodeError, Exception):
-                logger.warning("Could not load ledger from %s, starting fresh", self._path)
+        self._claims = self._backend.load_claims()
+        self._fingerprint_index = {}
+        for claim_id, claim in self._claims.items():
+            fp = _claim_fingerprint(claim)
+            self._fingerprint_index[fp] = claim_id
+
+    async def load_async(self) -> None:
+        """Async load for backends that require it (e.g. GraphitiBackend)."""
+        from noodly.storage.graphiti_backend import GraphitiBackend
+
+        if isinstance(self._backend, GraphitiBackend):
+            self._claims = await self._backend.load_claims_async()
+            self._fingerprint_index = {}
+            for claim_id, claim in self._claims.items():
+                fp = _claim_fingerprint(claim)
+                self._fingerprint_index[fp] = claim_id
 
     def _save(self) -> None:
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        data = [claim.model_dump(mode="json") for claim in self._claims.values()]
-        self._path.write_text(json.dumps(data, indent=2, default=str))
+        self._backend.save_all(self._claims)
+
+    async def _save_async(self) -> None:
+        """Async save for backends that require it."""
+        from noodly.storage.graphiti_backend import GraphitiBackend
+
+        if isinstance(self._backend, GraphitiBackend):
+            await self._backend.save_all_async(self._claims)
+        else:
+            self._backend.save_all(self._claims)
+
+    async def _save_claim_async(self, claim: Claim) -> None:
+        """Save a single claim via async backend."""
+        from noodly.storage.graphiti_backend import GraphitiBackend
+
+        if isinstance(self._backend, GraphitiBackend):
+            await self._backend.save_claim_async(claim)
+        else:
+            self._backend.save_claim(claim)
 
     def _apply_authority(self, claim: Claim, topic: str | None = None) -> None:
         """Stamp evidence with authority weights from the registry.
@@ -169,35 +145,6 @@ class FactLedger:
             return None
         return self._claims.get(existing_id)
 
-    def _find_semantic_duplicate(self, claim: Claim) -> Claim | None:
-        """Find the best semantic match above threshold using stored embeddings.
-
-        Only checks claims that already have embeddings persisted.
-        """
-        if not claim.embedding:
-            return None
-
-        best_match: Claim | None = None
-        best_score = 0.0
-
-        for existing in self._claims.values():
-            if not existing.embedding:
-                continue
-            similarity = _cosine_similarity(claim.embedding, existing.embedding)
-            if similarity > best_score and similarity >= self._semantic_dedup_threshold:
-                best_score = similarity
-                best_match = existing
-
-        if best_match:
-            logger.info(
-                "Semantic dedup (ingestion): '%.60s' matches '%.60s' (sim=%.3f)",
-                _claim_text(claim),
-                _claim_text(best_match),
-                best_score,
-            )
-
-        return best_match
-
     def _merge_into(self, existing: Claim, new_claim: Claim) -> Claim:
         """Merge new_claim's evidence into existing claim."""
         seen_artifacts = {str(ev.artifact_id) for ev in existing.evidence}
@@ -216,14 +163,11 @@ class FactLedger:
     def add_claim(self, claim: Claim) -> Claim:
         """Add a claim, deduplicating if an equivalent already exists.
 
-        Dedup order:
-        1. Exact fingerprint match (subject|predicate|object)
-        2. Semantic similarity match (if embeddings available)
-        3. Insert as new claim
+        Dedup: exact fingerprint match (subject|predicate|object).
+        Semantic dedup is handled by Graphiti natively when using GraphitiBackend.
         """
         self._apply_authority(claim)
 
-        # 1. Exact fingerprint dedup
         existing = self._find_duplicate(claim)
         if existing is not None:
             self._merge_into(existing, claim)
@@ -236,21 +180,7 @@ class FactLedger:
             self._save()
             return existing
 
-        # 2. Semantic dedup (using stored embeddings)
-        if claim.embedding:
-            semantic_match = self._find_semantic_duplicate(claim)
-            if semantic_match is not None:
-                self._merge_into(semantic_match, claim)
-                logger.info(
-                    "Ledger: semantic-merged into claim %s [%s] score=%.2f",
-                    semantic_match.id,
-                    semantic_match.status.value,
-                    semantic_match.truth_score,
-                )
-                self._save()
-                return semantic_match
-
-        # 3. Insert as new — run promotion check
+        # Insert as new — run promotion check
         self._auto_promote(claim)
 
         self._claims[str(claim.id)] = claim
@@ -265,44 +195,43 @@ class FactLedger:
         return claim
 
     async def add_claim_async(self, claim: Claim) -> Claim:
-        """Add a claim with automatic embedding computation.
-
-        If an EmbeddingProvider is configured and the claim has no embedding,
-        computes one before dedup.
-        """
+        """Add a claim using async persistence."""
         self._apply_authority(claim)
 
-        if self._embedder and not claim.embedding:
-            claim.embedding = await self._embedder.embed(_claim_text(claim))
+        existing = self._find_duplicate(claim)
+        if existing is not None:
+            self._merge_into(existing, claim)
+            logger.info(
+                "Ledger: merged evidence into existing claim %s [%s] score=%.2f",
+                existing.id,
+                existing.status.value,
+                existing.truth_score,
+            )
+            await self._save_claim_async(existing)
+            return existing
 
-        return self.add_claim(claim)
+        self._auto_promote(claim)
+
+        self._claims[str(claim.id)] = claim
+        self._fingerprint_index[_claim_fingerprint(claim)] = str(claim.id)
+        await self._save_claim_async(claim)
+        logger.info(
+            "Ledger: added claim %s [%s] score=%.2f",
+            claim.id,
+            claim.status.value,
+            claim.truth_score,
+        )
+        return claim
 
     async def add_claims_async(self, claims: list[Claim]) -> list[Claim]:
-        """Add multiple claims with batch embedding for efficiency.
-
-        Pre-embeds all claims in a single batch API call, then adds each
-        claim individually (benefiting from ingestion-time semantic dedup).
-        """
-        if self._embedder:
-            texts_to_embed = []
-            indices_to_embed = []
-            for i, claim in enumerate(claims):
-                if not claim.embedding:
-                    texts_to_embed.append(_claim_text(claim))
-                    indices_to_embed.append(i)
-
-            if texts_to_embed:
-                embeddings = await self._embedder.embed_batch(texts_to_embed)
-                for idx, embedding in zip(indices_to_embed, embeddings):
-                    claims[idx].embedding = embedding
-
+        """Add multiple claims with async persistence."""
         results = []
         for claim in claims:
-            results.append(self.add_claim(claim))
+            results.append(await self.add_claim_async(claim))
         return results
 
     def add_claims(self, claims: list[Claim]) -> list[Claim]:
-        """Add multiple claims (sync version, no embedding computation)."""
+        """Add multiple claims (sync version)."""
         results = []
         for claim in claims:
             results.append(self.add_claim(claim))

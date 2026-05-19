@@ -907,7 +907,7 @@ def embedding_stats() -> None:
 @click.option("--batch-size", default=100, help="Claims per API batch")
 def embed_claims(batch_size: int) -> None:
     """Backfill embeddings for claims that don't have them yet."""
-    from noodly.scoring.ledger import EmbeddingProvider, FactLedger, _claim_text
+    from noodly.scoring.ledger import FactLedger, _claim_text
 
     settings = get_settings()
 
@@ -916,10 +916,6 @@ def embed_claims(batch_size: int) -> None:
         raise SystemExit(1)
 
     ledger = FactLedger(settings.brain_dir / "ledger.json")
-    provider = EmbeddingProvider(
-        api_key=settings.openai_api_key,
-        model=settings.embedding_model,
-    )
 
     all_claims = ledger.list_claims(limit=100000)
     missing = [c for c in all_claims if not c.embedding]
@@ -931,12 +927,17 @@ def embed_claims(batch_size: int) -> None:
     console.print(f"Backfilling embeddings for {len(missing)} claims...")
 
     async def _embed():
+        from openai import AsyncOpenAI
+
+        client = AsyncOpenAI(api_key=settings.openai_api_key)
         for i in range(0, len(missing), batch_size):
             batch = missing[i : i + batch_size]
             texts = [_claim_text(c) for c in batch]
-            embeddings = await provider.embed_batch(texts)
-            for claim, emb in zip(batch, embeddings):
-                claim.embedding = emb
+            response = await client.embeddings.create(
+                model=settings.embedding_model, input=texts
+            )
+            for claim, data in zip(batch, response.data):
+                claim.embedding = data.embedding
             console.print(f"  Embedded {min(i + batch_size, len(missing))}/{len(missing)}")
 
     _run(_embed())
