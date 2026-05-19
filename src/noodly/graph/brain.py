@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import json
 import logging
+from typing import TYPE_CHECKING, Any
 
 from graphiti_core import Graphiti
 from graphiti_core.cross_encoder.openai_reranker_client import OpenAIRerankerClient
 from graphiti_core.driver.falkordb_driver import FalkorDriver
 from graphiti_core.embedder.openai import OpenAIEmbedder, OpenAIEmbedderConfig
+from graphiti_core.graphiti import AddEpisodeResults
 from graphiti_core.llm_client import OpenAIClient
 from graphiti_core.llm_client.config import LLMConfig
 from graphiti_core.nodes import EpisodeType
@@ -22,6 +24,9 @@ from graphiti_core.search.search_config import (
 
 from noodly.config import Settings
 from noodly.models.artifacts import SourceArtifact
+
+if TYPE_CHECKING:
+    from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +45,7 @@ class Brain:
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
-        driver = FalkorDriver(
+        self._driver = FalkorDriver(
             host=settings.falkordb_host,
             port=settings.falkordb_port,
             username=settings.falkordb_username,
@@ -60,25 +65,49 @@ class Brain:
         embedder = OpenAIEmbedder(config=embedder_config)
         cross_encoder = OpenAIRerankerClient(config=llm_config)
         self._graphiti = Graphiti(
-            graph_driver=driver,
+            graph_driver=self._driver,
             llm_client=llm_client,
             embedder=embedder,
             cross_encoder=cross_encoder,
         )
+
+    @property
+    def group_id(self) -> str:
+        """The configured graph partition identifier."""
+        return self._settings.group_id
+
+    def get_graphiti(self) -> Graphiti:
+        """Return the underlying Graphiti instance for direct operations."""
+        return self._graphiti
+
+    def get_driver(self) -> FalkorDriver:
+        """Return the graph driver for direct edge/node queries."""
+        return self._driver
 
     async def initialize(self) -> None:
         """Set up graph indices. Call once on first run."""
         await self._graphiti.build_indices_and_constraints()
         logger.info("Brain indices initialized")
 
-    async def ingest_artifact(self, artifact: SourceArtifact) -> str:
+    async def ingest_artifact(
+        self,
+        artifact: SourceArtifact,
+        *,
+        edge_types: dict[str, type[BaseModel]] | None = None,
+        custom_extraction_instructions: str | None = None,
+    ) -> AddEpisodeResults:
         """Ingest a source artifact as a Graphiti episode.
 
-        Returns the episode name for reference.
+        When *edge_types* is provided, Graphiti's extraction LLM produces
+        typed edges with structured attributes — e.g. CLAIM edges with
+        predicate, confidence, and knowledge_class fields.
+
+        Returns the full :class:`AddEpisodeResults` so the caller can
+        inspect extracted edges and nodes.
         """
         episode_name = f"{artifact.source_type.value}-{artifact.id}"
 
-        metadata = {
+        metadata: dict[str, Any] = {
             "source_type": artifact.source_type.value,
             "source_uri": artifact.source_uri,
             "title": artifact.title,
@@ -94,17 +123,19 @@ class Brain:
 
         ref_time = artifact.content_created_at or artifact.created_at
 
-        await self._graphiti.add_episode(
+        results = await self._graphiti.add_episode(
             name=episode_name,
             episode_body=episode_body,
             source=EpisodeType.json,
             source_description=f"{artifact.source_type.value}: {artifact.title}",
             reference_time=ref_time,
             group_id=self._settings.group_id,
+            edge_types=edge_types,
+            custom_extraction_instructions=custom_extraction_instructions,
         )
 
         logger.info("Ingested artifact %s as episode %s", artifact.id, episode_name)
-        return episode_name
+        return results
 
     async def search_nodes(self, query: str, limit: int = 10) -> list[dict]:
         """Semantic + keyword hybrid search over entity nodes."""

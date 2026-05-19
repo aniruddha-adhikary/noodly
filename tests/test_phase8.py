@@ -13,7 +13,6 @@ from noodly.scoring.ledger import (
     FactLedger,
     _claim_fingerprint,
     _claim_text,
-    _cosine_similarity,
 )
 
 
@@ -39,31 +38,6 @@ def _make_embedding(dim: int = 8, seed: float = 1.0) -> list[float]:
     raw = [math.sin(seed * (i + 1)) for i in range(dim)]
     norm = math.sqrt(sum(x * x for x in raw))
     return [x / norm for x in raw]
-
-
-# ---------------------------------------------------------------------------
-# Cosine similarity helper
-# ---------------------------------------------------------------------------
-
-
-class TestCosineSimilarity:
-    def test_identical_vectors(self):
-        v = [1.0, 0.0, 0.0]
-        assert abs(_cosine_similarity(v, v) - 1.0) < 1e-6
-
-    def test_orthogonal_vectors(self):
-        a = [1.0, 0.0]
-        b = [0.0, 1.0]
-        assert abs(_cosine_similarity(a, b)) < 1e-6
-
-    def test_empty_vectors(self):
-        assert _cosine_similarity([], []) == 0.0
-
-    def test_different_lengths(self):
-        assert _cosine_similarity([1.0], [1.0, 2.0]) == 0.0
-
-    def test_zero_vector(self):
-        assert _cosine_similarity([0.0, 0.0], [1.0, 0.0]) == 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -123,49 +97,26 @@ class TestExactDedup:
 
 
 # ---------------------------------------------------------------------------
-# Semantic dedup at ingestion time
+# Exact dedup still works (semantic dedup now handled by Graphiti natively)
 # ---------------------------------------------------------------------------
 
 
-class TestIngestionSemanticDedup:
-    def test_semantic_match_merges(self, tmp_path):
-        """Claims with similar embeddings should be merged at ingestion."""
-        ledger = FactLedger(tmp_path / "ledger.json", semantic_dedup_threshold=0.90)
+class TestIngestionDedup:
+    def test_no_embedding_still_dedupes_by_fingerprint(self, tmp_path):
+        """Claims without embeddings should still dedup by fingerprint."""
+        ledger = FactLedger(tmp_path / "ledger.json")
 
-        emb1 = _make_embedding(dim=8, seed=1.0)
-        # Slightly perturbed — should still be similar enough
-        emb2 = [x + 0.01 for x in emb1]
-        norm2 = math.sqrt(sum(x * x for x in emb2))
-        emb2 = [x / norm2 for x in emb2]
-
-        c1 = _make_claim("Singapore", "imposes", "import tariff", embedding=emb1)
-        c2 = _make_claim("Singapore", "levies", "import duty", embedding=emb2)
+        c1 = _make_claim("A", "is", "B")
+        c2 = _make_claim("A", "is", "B")
 
         ledger.add_claim(c1)
         result = ledger.add_claim(c2)
 
-        # Should merge into c1 since embeddings are similar
         assert result.id == c1.id
-        assert len(result.evidence) >= 2
         assert ledger.count == 1
 
-    def test_dissimilar_embeddings_no_merge(self, tmp_path):
-        """Claims with very different embeddings should NOT be merged."""
-        ledger = FactLedger(tmp_path / "ledger.json", semantic_dedup_threshold=0.90)
-
-        emb1 = _make_embedding(dim=8, seed=1.0)
-        emb2 = _make_embedding(dim=8, seed=100.0)  # very different seed
-
-        c1 = _make_claim("Singapore", "imposes", "import tariff", embedding=emb1)
-        c2 = _make_claim("Python", "is", "a programming language", embedding=emb2)
-
-        ledger.add_claim(c1)
-        ledger.add_claim(c2)
-
-        assert ledger.count == 2
-
-    def test_no_embedding_skips_semantic_dedup(self, tmp_path):
-        """Claims without embeddings should skip semantic dedup."""
+    def test_different_claims_stored_separately(self, tmp_path):
+        """Claims with different fingerprints should not be merged."""
         ledger = FactLedger(tmp_path / "ledger.json")
 
         c1 = _make_claim("A", "is", "B")
@@ -177,7 +128,7 @@ class TestIngestionSemanticDedup:
         assert ledger.count == 2
 
     def test_exact_match_takes_priority(self, tmp_path):
-        """Exact fingerprint match should happen before semantic dedup."""
+        """Exact fingerprint match should happen before any other dedup."""
         ledger = FactLedger(tmp_path / "ledger.json")
 
         emb1 = _make_embedding(dim=8, seed=1.0)
@@ -189,37 +140,7 @@ class TestIngestionSemanticDedup:
         ledger.add_claim(c1)
         result = ledger.add_claim(c2)
 
-        assert result.id == c1.id  # exact match, not semantic
-
-    def test_configurable_threshold(self, tmp_path):
-        """Threshold should be configurable."""
-        emb1 = _make_embedding(dim=8, seed=1.0)
-        emb2 = [x + 0.05 for x in emb1]
-        norm2 = math.sqrt(sum(x * x for x in emb2))
-        emb2 = [x / norm2 for x in emb2]
-
-        sim = _cosine_similarity(emb1, emb2)
-
-        # With very high threshold — should NOT merge
-        ledger_strict = FactLedger(
-            tmp_path / "ledger_strict.json", semantic_dedup_threshold=0.9999
-        )
-        c1 = _make_claim("A", "does", "X", embedding=emb1)
-        c2 = _make_claim("A", "performs", "X", embedding=emb2)
-        ledger_strict.add_claim(c1)
-        ledger_strict.add_claim(c2)
-        assert ledger_strict.count == 2
-
-        # With threshold below the similarity — SHOULD merge
-        ledger_loose = FactLedger(
-            tmp_path / "ledger_loose.json", semantic_dedup_threshold=sim - 0.01
-        )
-        c3 = _make_claim("B", "does", "Y", embedding=emb1)
-        c4 = _make_claim("B", "performs", "Y", embedding=emb2)
-        ledger_loose.add_claim(c3)
-        result = ledger_loose.add_claim(c4)
-        assert ledger_loose.count == 1
-        assert result.id == c3.id
+        assert result.id == c1.id
 
 
 # ---------------------------------------------------------------------------
@@ -334,25 +255,14 @@ class TestClaimPromotion:
 
 
 # ---------------------------------------------------------------------------
-# Async claim addition (with mock embedder)
+# Async claim addition
 # ---------------------------------------------------------------------------
 
 
 class TestAsyncClaimAddition:
-    def test_add_claims_async_embeds_and_dedup(self, tmp_path):
-        """add_claims_async should embed claims and dedup semantically."""
-
-        class MockEmbedder:
-            async def embed(self, text: str) -> list[float]:
-                return _make_embedding(dim=8, seed=hash(text) % 100)
-
-            async def embed_batch(self, texts: list[str]) -> list[list[float]]:
-                return [_make_embedding(dim=8, seed=hash(t) % 100) for t in texts]
-
-        ledger = FactLedger(
-            tmp_path / "ledger.json",
-            embedding_provider=MockEmbedder(),
-        )
+    def test_add_claims_async_stores_multiple(self, tmp_path):
+        """add_claims_async should add multiple claims."""
+        ledger = FactLedger(tmp_path / "ledger.json")
 
         claims = [
             _make_claim("A", "is", "X"),
@@ -364,31 +274,19 @@ class TestAsyncClaimAddition:
         loop.close()
 
         assert len(results) == 2
-        # Both should have embeddings
-        for claim_id in ledger._claims:
-            assert len(ledger._claims[claim_id].embedding) > 0
+        assert ledger.count == 2
 
     def test_add_claim_async_single(self, tmp_path):
-        """add_claim_async should embed a single claim."""
-
-        class MockEmbedder:
-            async def embed(self, text: str) -> list[float]:
-                return _make_embedding(dim=8, seed=1.0)
-
-            async def embed_batch(self, texts: list[str]) -> list[list[float]]:
-                return [_make_embedding(dim=8, seed=1.0) for _ in texts]
-
-        ledger = FactLedger(
-            tmp_path / "ledger.json",
-            embedding_provider=MockEmbedder(),
-        )
+        """add_claim_async should add a single claim."""
+        ledger = FactLedger(tmp_path / "ledger.json")
 
         claim = _make_claim("A", "is", "X")
         loop = asyncio.new_event_loop()
         result = loop.run_until_complete(ledger.add_claim_async(claim))
         loop.close()
 
-        assert len(result.embedding) == 8
+        assert result.id == claim.id
+        assert ledger.count == 1
 
 
 # ---------------------------------------------------------------------------

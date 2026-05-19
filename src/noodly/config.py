@@ -91,6 +91,9 @@ class Settings(BaseSettings):
     # Phase 7: topic-aware authority
     authority_topic_inference: str = "llm"  # llm | keyword
 
+    # Phase 9: unified Graphiti extraction
+    use_graphiti_backend: bool = False  # store claims as Graphiti edges
+
 
 def get_settings() -> Settings:
     """Return cached settings instance."""
