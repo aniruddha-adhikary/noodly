@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from uuid import UUID
 
 from noodly.caching.manager import CacheManager
 from noodly.config import Settings
@@ -486,6 +487,7 @@ class Pipeline:
             obj = node_map.get(edge.target_node_uuid, "")
 
             claim = Claim(
+                id=UUID(edge.uuid),
                 subject=subject,
                 predicate=attrs.get("predicate", edge.fact or ""),
                 object=obj,
